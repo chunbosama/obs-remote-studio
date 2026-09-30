@@ -1,0 +1,366 @@
+/* QSS 模板：@TOKEN@ 会在启动时按当前主题替换（见 ui/theme.py）。
+   改颜色请改 theme.py，不要在这里写死色值。 */
+
+QWidget {
+    color: @TEXT@;
+    font-size: 12px;
+}
+
+QMainWindow, QDialog {
+    background: @BG@;
+}
+
+/* ---------------------------------------------------------------- 菜单 */
+QMenuBar {
+    background: @SURFACE_ALT@;
+    border-bottom: 1px solid @BORDER@;
+    padding: 1px 2px;
+}
+QMenuBar::item {
+    padding: 3px 8px;
+    background: transparent;
+}
+QMenuBar::item:selected {
+    background: @HOVER@;
+}
+QMenuBar::item:pressed {
+    background: @SELECT@;
+}
+
+QMenu {
+    background: @SURFACE_ALT@;
+    border: 1px solid @BORDER_STRONG@;
+    padding: 3px 0;
+}
+QMenu::item {
+    padding: 4px 26px 4px 22px;
+}
+QMenu::item:selected {
+    background: @SELECT@;
+    color: @TEXT_ON_ACCENT@;
+}
+QMenu::item:disabled {
+    color: @TEXT_DISABLED@;
+}
+QMenu::separator {
+    height: 1px;
+    background: @BORDER@;
+    margin: 4px 8px;
+}
+
+/* ---------------------------------------------------------------- 面板 */
+QFrame#dockPanel {
+    background: @SURFACE@;
+    border: 1px solid @BORDER@;
+}
+QLabel#dockTitle {
+    background: @HEADER@;
+    color: @HEADER_TEXT@;
+    padding: 4px 6px;
+    border-bottom: 1px solid @BORDER@;
+}
+
+QGroupBox {
+    border: 1px solid @BORDER@;
+    margin-top: 12px;
+    padding: 6px;
+    background: @SURFACE@;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 8px;
+    padding: 0 4px;
+    color: @HEADER_TEXT@;
+}
+
+/* ---------------------------------------------------------------- 列表 */
+QListWidget, QListView {
+    background: @SURFACE@;
+    border: none;
+    outline: none;
+}
+QListWidget::item {
+    padding: 4px 6px;
+    border: none;
+}
+QListWidget::item:selected {
+    background: @SELECT@;
+    color: @TEXT_ON_ACCENT@;
+}
+QListWidget::item:hover:!selected {
+    background: @SURFACE_HOVER@;
+}
+
+QTableWidget, QTableView {
+    background: @SURFACE@;
+    alternate-background-color: @SURFACE_ALT@;
+    gridline-color: @BORDER@;
+    border: 1px solid @BORDER@;
+}
+QHeaderView::section {
+    background: @HEADER@;
+    color: @HEADER_TEXT@;
+    border: none;
+    border-right: 1px solid @BORDER@;
+    padding: 4px;
+}
+
+/* ---------------------------------------------------------------- 按钮 */
+QPushButton {
+    background: @BUTTON@;
+    color: @TEXT@;
+    border: 1px solid @BORDER_STRONG@;
+    border-radius: 2px;
+    padding: 4px 10px;
+    min-height: 16px;
+}
+QPushButton:hover {
+    background: @BUTTON_HOVER@;
+}
+QPushButton:pressed {
+    background: @BUTTON_PRESSED@;
+}
+QPushButton:disabled {
+    background: @BUTTON_DISABLED@;
+    color: @TEXT_DISABLED@;
+    border-color: @BUTTON_DISABLED_BORDER@;
+}
+QPushButton:checked {
+    background: @ACCENT@;
+    color: @TEXT_ON_ACCENT@;
+    border: 1px solid @ACCENT_BORDER@;
+}
+
+/* 小方块按钮（场景/来源面板底部那一排） */
+QPushButton#panelToolButton {
+    background: transparent;
+    border: none;
+    padding: 2px;
+    min-width: 20px;
+    max-width: 24px;
+}
+QPushButton#panelToolButton:hover {
+    background: @HOVER@;
+}
+
+/* 面板里的小按钮（混音器的 dB/% 切换、高级） */
+QPushButton#miniButton {
+    background: transparent;
+    border: 1px solid @BORDER_STRONG@;
+    padding: 1px 4px;
+    min-height: 14px;
+    color: @FADER_VALUE@;
+}
+QPushButton#miniButton:hover {
+    background: @HOVER@;
+}
+QPushButton#miniButton:disabled {
+    color: @TEXT_DISABLED@;
+    border-color: @BUTTON_DISABLED_BORDER@;
+}
+
+/* 混音器的静音按钮 */
+QToolButton:checked {
+    background: @MUTED_BG@;
+    border: 1px solid @MUTED_BORDER@;
+}
+
+/* 控制按钮面板 */
+QPushButton#controlButton {
+    background: @BUTTON@;
+    border: 1px solid @BORDER_STRONG@;
+    text-align: center;
+    padding: 6px;
+}
+QPushButton#controlButton:hover {
+    background: @BUTTON_HOVER@;
+}
+QPushButton#studioModeButton:checked {
+    background: @ACCENT@;
+    border: 1px solid @ACCENT_BORDER@;
+    color: @TEXT_ON_ACCENT@;
+}
+
+/* 预览面板中间那一列的大按钮 */
+QPushButton#transitionButton {
+    padding: 6px;
+    background: @BUTTON@;
+}
+
+QToolButton {
+    background: transparent;
+    border: none;
+    color: @TEXT@;
+    padding: 2px 5px;
+}
+QToolButton:hover {
+    background: @HOVER@;
+}
+
+QCheckBox {
+    spacing: 5px;
+}
+QCheckBox::indicator {
+    width: 13px;
+    height: 13px;
+    border: 1px solid @CHECK_BORDER@;
+    background: @SURFACE_ALT@;
+}
+QCheckBox::indicator:checked {
+    background: @ACCENT@;
+    border-color: @ACCENT_BORDER@;
+}
+
+/* ---------------------------------------------------------------- 输入 */
+QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {
+    background: @SURFACE_ALT@;
+    color: @TEXT@;
+    border: 1px solid @BORDER_STRONG@;
+    border-radius: 2px;
+    padding: 3px 6px;
+    selection-background-color: @SELECT@;
+}
+QComboBox:hover, QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover {
+    border-color: @SCROLL_HANDLE_HOVER@;
+}
+QComboBox::drop-down {
+    width: 16px;
+    border: none;
+}
+QComboBox::down-arrow {
+    image: none;
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+    border-top: 4px solid @ARROW@;
+    margin-right: 5px;
+}
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    background: @BUTTON@;
+    border: none;
+    width: 14px;
+}
+
+/* 弹出层是独立顶层窗口，不继承上面的颜色，必须显式写死 */
+QComboBox QAbstractItemView {
+    background: @SURFACE_ALT@;
+    color: @TEXT@;
+    border: 1px solid @BORDER_STRONG@;
+    outline: none;
+    selection-background-color: @SELECT@;
+    selection-color: @TEXT_ON_ACCENT@;
+}
+QComboBox QAbstractItemView::item {
+    padding: 4px 8px;
+    min-height: 18px;
+}
+
+QToolTip {
+    background: @SURFACE_ALT@;
+    color: @TEXT@;
+    border: 1px solid @BORDER_STRONG@;
+    padding: 3px 5px;
+}
+
+/* ---------------------------------------------------------------- 混音器推子 */
+QSlider::groove:horizontal {
+    height: 5px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                stop:0 @GROOVE_1@, stop:0.5 @GROOVE_2@, stop:1 @GROOVE_3@);
+    border: 1px solid @BORDER@;
+}
+QSlider::handle:horizontal {
+    background: @SLIDER_HANDLE@;
+    border: 1px solid @SLIDER_HANDLE_BORDER@;
+    width: 7px;
+    margin: -5px 0;
+}
+/* T 型推杆（竖直），OBS 里是一根灰轨道加一个方块手柄 */
+QSlider::groove:vertical {
+    width: 5px;
+    background: @HOVER@;
+    border: 1px solid @BORDER_STRONG@;
+}
+QSlider::handle:vertical {
+    background: @SLIDER_HANDLE@;
+    border: 1px solid @SLIDER_HANDLE_BORDER@;
+    height: 9px;
+    margin: 0 -5px;
+}
+
+/* ---------------------------------------------------------------- 分区与滚动条 */
+QSplitter::handle {
+    background: @BG@;
+}
+QSplitter::handle:horizontal {
+    width: 3px;
+}
+QSplitter::handle:vertical {
+    height: 3px;
+}
+QSplitter::handle:hover {
+    background: @SELECT@;
+}
+
+QScrollBar:vertical {
+    background: @SURFACE@;
+    width: 10px;
+    margin: 0;
+}
+QScrollBar::handle:vertical {
+    background: @SCROLL_HANDLE@;
+    min-height: 20px;
+}
+QScrollBar::handle:vertical:hover {
+    background: @SCROLL_HANDLE_HOVER@;
+}
+QScrollBar::add-line, QScrollBar::sub-line {
+    height: 0;
+    width: 0;
+}
+QScrollBar::add-page, QScrollBar::sub-page {
+    background: transparent;
+}
+QScrollBar:horizontal {
+    background: @SURFACE@;
+    height: 10px;
+}
+QScrollBar::handle:horizontal {
+    background: @SCROLL_HANDLE@;
+    min-width: 20px;
+}
+
+/* ---------------------------------------------------------------- 其它 */
+QLabel#paneTitle {
+    color: @HEADER_TEXT@;
+    padding: 2px 0;
+}
+QLabel#previewPlaceholder {
+    color: @TEXT_DISABLED@;
+}
+QLabel#hint {
+    color: @TEXT_DIM@;
+}
+QLabel#faderValue {
+    color: @FADER_VALUE@;
+}
+QLabel#faderScale {
+    color: @FADER_SCALE@;
+    font-size: 9px;
+}
+QFrame#zoomBar {
+    background: @SURFACE_ALT@;
+    border-top: 1px solid @BORDER@;
+}
+QFrame#videoArea {
+    background: @PREVIEW_BG@;
+    border: 1px solid @BORDER@;
+}
+QStatusBar {
+    background: @SURFACE_ALT@;
+    border-top: 1px solid @BORDER@;
+}
+QStatusBar::item {
+    border: none;
+}
