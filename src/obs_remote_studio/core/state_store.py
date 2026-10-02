@@ -73,6 +73,8 @@ class StateStore(QObject):
     profiles_changed = Signal()
     # G4：T 型推杆位置（0.0~1.0）
     tbar_changed = Signal()
+    # G4：OBS 收下了推杆请求却没有反应（已知的 OBS 侧缺陷，见 controller 里的说明）
+    tbar_ignored_changed = Signal()
 
     error_raised = Signal(str, str)  # 标题, 详情
 
@@ -105,6 +107,8 @@ class StateStore(QObject):
         # 服务端回过 604：请求名合法，但这台机器上该资源当前不可用
         # （没配回放缓冲、虚拟摄像机驱动缺失…）。用于把对应按钮置灰。
         self.unavailable_requests: set[str] = set()
+        # 每个不可用请求的**原因**，给 tooltip / 提示文字用
+        self.unavailable_reasons: dict[str, str] = {}
 
         # E：混音器。meters 更新极其频繁（60Hz 级），刻意不发信号，
         # 由电平表控件按自己的刷新率来读，避免信号风暴。
@@ -116,6 +120,8 @@ class StateStore(QObject):
         self.health = ConnectionHealth()
         self.record_warning = RecordWarning()
         self.tbar_position: float = 0.0
+        # OBS 收下了推杆请求却毫无反应（已知的 OBS 侧缺陷）——用来在界面上解释原因
+        self.tbar_ignored: bool = False
         self.media: list[MediaStatus] = []
         self.scene_collections: list[str] = []
         self.current_scene_collection: str = ""
@@ -141,6 +147,14 @@ class StateStore(QObject):
     def set_tbar_position(self, value: float) -> None:
         self.tbar_position = max(0.0, min(float(value), 1.0))
         self.tbar_changed.emit()
+
+    def set_tbar_ignored(self, value: bool) -> None:
+        """OBS 收下推杆请求却没有产生任何转场动作（已知 OBS 侧缺陷）。"""
+        value = bool(value)
+        if self.tbar_ignored == value:
+            return
+        self.tbar_ignored = value
+        self.tbar_ignored_changed.emit()
 
     def set_media(self, items: list[MediaStatus]) -> None:
         self.media = items
@@ -363,6 +377,7 @@ class StateStore(QObject):
         self.supported_requests = set(requests or ())
         self.rejected_requests.clear()  # 新连接重新评估
         self.unavailable_requests.clear()
+        self.unavailable_reasons.clear()
         self.capabilities_changed.emit()
 
     def mark_unsupported(self, request_type: str) -> None:
@@ -372,25 +387,32 @@ class StateStore(QObject):
         self.rejected_requests.add(request_type)
         self.capabilities_changed.emit()
 
-    def mark_unavailable(self, request_type: str) -> None:
-        """服务端回过 604：请求名没问题，但资源当前不可用。
+    def mark_unavailable(self, request_type: str, reason: str = "") -> None:
+        """服务端回过 604 / 506 一类"请求名没问题，但当前状态下用不了"。
 
-        与 mark_unsupported 分开：604 是运行时的常态（这台机器就没配回放缓冲），
-        不代表协议不支持。这里只用于把 UI 收起来，发不发请求仍由 supports() 决定。
+        与 mark_unsupported 分开：这类是运行时的常态（这台机器就没配回放缓冲、
+        OBS 那边没开工作室模式），不代表协议不支持。
+        这里只用于把 UI 收起来并说明原因，发不发请求仍由 supports() 决定。
         """
         if request_type in self.unavailable_requests:
             return
         self.unavailable_requests.add(request_type)
+        if reason:
+            self.unavailable_reasons[request_type] = reason
         self.capabilities_changed.emit()
 
     def is_unavailable(self, request_type: str) -> bool:
         return request_type in self.unavailable_requests
+
+    def unavailable_reason(self, request_type: str) -> str:
+        return self.unavailable_reasons.get(request_type, "")
 
     def clear_unavailable(self, request_type: str) -> None:
         """资源恢复可用（拿到正常响应）时撤销降级，让 UI 重新露出来。"""
         if request_type not in self.unavailable_requests:
             return
         self.unavailable_requests.discard(request_type)
+        self.unavailable_reasons.pop(request_type, None)
         self.capabilities_changed.emit()
 
     def supports(self, request_type: str) -> bool:
@@ -421,6 +443,8 @@ class StateStore(QObject):
         self.health = ConnectionHealth()
         self.record_warning = RecordWarning()
         self.tbar_position = 0.0
+        # OBS 收下了推杆请求却毫无反应（已知的 OBS 侧缺陷）——用来在界面上解释原因
+        self.tbar_ignored = False
         self.media = []
         self.scene_collections = []
         self.current_scene_collection = ""

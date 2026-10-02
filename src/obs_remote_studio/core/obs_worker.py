@@ -59,6 +59,8 @@ class ObsWorker(QObject):
     connect_failed = Signal(str, str)  # kind, message
     disconnected = Signal(str)  # reason
     event_link_failed = Signal(str)  # 事件通道建立失败（不影响请求）
+    retry_event_link = Signal()      # 重新尝试建立事件通道
+    event_link_ready = Signal()      # 事件通道已就绪（首次或重试成功）
     event_received = Signal(str, object)  # eventType, payload
     result_ready = Signal(str, object)  # requestType, response（无返回值的请求为 None）
     # requestType, message, transport_lost, error_code
@@ -101,6 +103,8 @@ class ObsWorker(QObject):
         password = str(cfg.get("password", "") or "")
         self._timeout = float(cfg.get("timeout", 3.0))
         self._subscriptions = int(cfg.get("subscription_mask", P.SUBSCRIPTION_MASK))
+        # 事件通道是**独立的第二条 websocket**，可能单独建失败。留住参数以便重试。
+        self._event_target = (host, port, password)
 
         # 重复连接（例如换一台 OBS）时先关掉旧连接，避免 socket 泄漏、
         # 以及旧事件通道继续往这边推事件
@@ -165,6 +169,26 @@ class ObsWorker(QObject):
 
         handlers = [self._make_callback(evt, cb) for evt, cb in P.EVENTS.items()]
         self._events.callback.register(handlers)
+        self.event_link_ready.emit()
+
+    @Slot()
+    def _on_retry_event_link(self) -> None:
+        """重建事件通道。
+
+        事件通道建失败后此前是**一锤子买卖**：建不上就再也没事件了，
+        场景变化、录制状态这些全靠事件的显示项会一直不动 —— 对直播控制来说不能接受。
+        控制通道还在就允许重试。
+        """
+        if self._req is None:
+            return  # 控制通道都没了，重试没有意义
+        target = getattr(self, "_event_target", None)
+        if not target:
+            return
+        try:
+            self._events = None
+        except Exception:  # noqa: BLE001
+            pass
+        self._start_event_client(*target)
 
     def _make_callback(self, event_type: str, callback_name: str):
         def handler(data, _type=event_type):
@@ -207,12 +231,14 @@ class ObsWorker(QObject):
             if client is not self._req or session != self._session:
                 # 连接已被替换/关闭：这条失败是上一轮的残响，直接丢弃
                 logger.debug("丢弃旧连接上的失败结果：%s（%s）", request_type, exc)
+                self._trace_dropped(request_type, "连接已更换，该失败属于上一条连接，已丢弃")
                 return
             self._emit_request_failure(request_type, exc)
             return
         except Exception as exc:  # noqa: BLE001
             if client is not self._req or session != self._session:
                 logger.debug("丢弃旧连接上的异常结果：%s（%s）", request_type, exc)
+                self._trace_dropped(request_type, "连接已更换，该异常属于上一条连接，已丢弃")
                 return
             self.raw_trace.emit("<-", "error", {"requestType": request_type, "error": str(exc)})
             self.request_failed.emit(request_type, str(exc), False, 0)
@@ -221,9 +247,23 @@ class ObsWorker(QObject):
         if client is not self._req or session != self._session:
             # 响应迟到且连接已换人：结果同样不能用
             logger.debug("丢弃旧连接上的迟到响应：%s", request_type)
+            self._trace_dropped(request_type, "连接已更换，迟到的响应已丢弃")
             return
         self.raw_trace.emit("<-", "response", {"requestType": request_type, "response": _to_plain(response)})
         self.result_ready.emit(request_type, response)
+
+    def _trace_dropped(self, request_type: str, reason: str) -> None:
+        """记一条"结果被丢弃"的帧。
+
+        这条路径原来是**完全静默**的（只写 debug 日志），于是诊断窗口里就会出现
+        "有请求帧、之后再没有任何帧"的现象 —— 排障的人只能推断成"OBS 没回响应"，
+        而真相是响应属于上一条连接、被我们主动丢了。
+        诊断工具的职责是把这类事也说出来。
+        """
+        self.raw_trace.emit(
+            "<-", "error",
+            {"requestType": request_type, "dropped": True, "reason": reason},
+        )
 
     def _emit_request_failure(self, request_type: str, exc: BaseException) -> None:
         """按异常类型归好类，再把失败抛给主线程。"""
@@ -233,9 +273,21 @@ class ObsWorker(QObject):
             # 靠文案分支判断太脆，所以把数字一并传上去。
             code = int(getattr(exc, "code", 0) or 0)
             comment = getattr(exc, "comment", "") or str(exc)
+            # **还原成协议原样的响应帧**（op 7 的 requestStatus 形状）。
+            # 之前这里记的是自定义的 {requestType, code, comment}，而诊断窗口的用途
+            # 正是"看线上到底回了什么"——用户按 requestStatus.code 去找根本找不到，
+            # 反而会以为"OBS 压根没回响应"。服务端明明回了，是客户端把它转手改了样。
             self.raw_trace.emit(
-                "<-", "error",
-                {"requestType": request_type, "code": code, "comment": comment},
+                "<-",
+                "response",
+                {
+                    "requestType": request_type,
+                    "requestStatus": {
+                        "result": False,
+                        "code": code,
+                        "comment": comment,
+                    },
+                },
             )
             self.request_failed.emit(request_type, comment, False, code)
             return

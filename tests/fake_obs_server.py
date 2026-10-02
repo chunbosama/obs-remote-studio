@@ -174,6 +174,7 @@ class FakeObsServer:
         media_inputs: bool = True,
         config_switch: bool = True,
         tbar: bool = True,
+        tbar_silent: bool = False,
     ):
         """legacy_transitions=True：模拟 obs-websocket 5.0，只认 GetTransitionList。
         hide_available_requests=True：GetVersion 不上报 availableRequests，
@@ -200,6 +201,8 @@ class FakeObsServer:
         self.media_inputs = media_inputs
         self.config_switch = config_switch
         self.tbar = tbar
+        # True：忠实模拟 OBS ≥29.1 的缺陷 —— SetTBarPosition 返回成功但什么都不做
+        self.tbar_silent = tbar_silent
         self.state = FakeObsState()
         self.requests: list[str] = []
 
@@ -786,6 +789,9 @@ class FakeObsServer:
                 {"sceneName": st.preview_scene},
             )
         if req_type == "TriggerStudioModeTransition":
+            # 同样要求工作室模式（服务端实现里是同一处检查）
+            if not st.studio_mode:
+                return None, ("__error__", (506, "Studio Mode is not active"))
             st.current_scene = st.preview_scene
             return None, [
                 ("SceneTransitionStarted", {"transitionName": st.current_transition}),
@@ -839,6 +845,20 @@ class FakeObsServer:
         #                  距 0 端 <= T_BAR_CLAMP 回退；中间则**什么都不做**（转场保持挂起）。
         #   结束时 OBS 会把 tBar 归零。
         if req_type == "SetTBarPosition":
+            # 真实 OBS 的服务端第一件事就是检查工作室模式
+            # （obs-websocket RequestHandler_Transitions.cpp 的 SetTBarPosition）
+            if not st.studio_mode:
+                return None, (
+                    "__error__",
+                    (506, "Studio Mode is not active"),
+                )
+            if self.tbar_silent:
+                # 忠实建模 OBS ≥29.1 的缺陷（obs-studio issue #11372 / PR #13143）：
+                # 请求**返回成功**，但 OBS 端什么都不做 —— 因为
+                # obs_frontend_set_tbar_position 不再更新推杆控件，而结束转场时
+                # 读的正是该控件的值，于是 API 根本完不成手动转场。
+                # 这个开关用来验证客户端能不能自己发现"请求成功但没效果"。
+                return None, None
             position = max(0.0, min(float(payload["position"]), 1.0))
             release = bool(payload.get("release", False))
             st.tbar_position = position

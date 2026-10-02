@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ...core import protocol as P
 from ...core.state_store import CONNECTED, StateStore
 from ...utils.dpi import device_ratio, snap_rect
 from .. import theme
@@ -41,10 +42,6 @@ FIT_LABEL = "缩放至窗口"
 TRANSITION_COLUMN_WIDTH = 190
 TBAR_THROTTLE_MS = 150   # G4：推杆提交节流（与混音器推子同档）
 TBAR_HEIGHT = 22
-# OBS 的完成判定带 10% 量程的容差（window-basic-main-transitions.cpp 里
-# T_BAR_CLAMP = T_BAR_PRECISION / 10）。客户端沿用同一个阈值，
-# 免得"我觉得没推到底、OBS 觉得到了"两边判断打架。
-TBAR_CLAMP = 0.1
 TBAR_TOOLTIP = (
     "T 型推杆：向右推到底并松手即完成转场（预览 → 输出）。\n"
     "中途松手会退回，不会切换画面。与 OBS 一致，需要工作室模式。"
@@ -277,6 +274,12 @@ class _TransitionColumn(QWidget):
         tbar_row.addWidget(QLabel("输出"))
         layout.addLayout(tbar_row)
 
+        # 推杆不可用时把原因直接写在界面上（工具栏只有 190px 宽，允许折行）
+        self.tbar_hint = QLabel("")
+        self.tbar_hint.setWordWrap(True)
+        self.tbar_hint.setVisible(False)
+        layout.addWidget(self.tbar_hint)
+
         # G4：拖动节流。推杆要连续推，所以是"按时发中间值"，
         # 与混音器推子那种"停手才提交"不同。
         self._tbar_timer = QTimer(self)
@@ -294,8 +297,11 @@ class _TransitionColumn(QWidget):
         store.capabilities_changed.connect(self._update_from_store)
         # 转场方式换了也要刷新按钮/推杆（"剪切"不能用推杆，提示要跟着变）
         store.transition_changed.connect(self._update_button)
-        store.transitioning_changed.connect(self._update_button)
+        # 被 OBS 拒过 / 工作室模式变了 → 推杆的可用性与原因文字都要跟着更新
+        store.capabilities_changed.connect(self._update_button)
         store.studio_changed.connect(self._update_button)
+        store.tbar_ignored_changed.connect(self._update_button)
+        store.transitioning_changed.connect(self._update_button)
         store.connection_state_changed.connect(self._on_connection_state)
         store.tbar_changed.connect(self._update_tbar)
 
@@ -342,24 +348,48 @@ class _TransitionColumn(QWidget):
         # 拖拽中断 → sliderReleased 不再触发 → release=true 永远发不出去
         # → OBS 侧转场一直开着、SceneTransitionEnded 不来 → 按钮卡在「转场中」。
         # 所以推杆只看"能不能用"，不看"是不是正在转场"（OBS 里推杆也是随时可拖的）。
-        tbar_ok = self.store.studio_mode and self.store.supports("SetTBarPosition")
+        tbar_ok = self._tbar_usable()
         self.tbar.setEnabled(tbar_ok)
-        if not self.store.supports("SetTBarPosition"):
-            self.tbar.setToolTip("T 型推杆：当前 OBS 版本不支持（SetTBarPosition），暂不可用")
-        elif not self.store.studio_mode:
-            self.tbar.setToolTip("T 型推杆只在工作室模式下可用")
-        elif self._is_cut_transition():
-            # OBS 的 ValidTBarTransition() 明确排除 cut / stinger 两种转场。
-            # 虽然 OBS 推杆时会自动临时改用淡入淡出，但那是隐式行为，
-            # 先说清楚，免得用户以为"推了没反应"。
-            self.tbar.setToolTip(
-                "T 型推杆：当前转场是「剪切」，无法手动推动。\n"
-                "推杆时 OBS 会临时改用淡入淡出，想稳定使用请先把转场换成淡入淡出。"
-            )
-        else:
-            self.tbar.setToolTip(TBAR_TOOLTIP)
+        self.tbar.setToolTip(TBAR_TOOLTIP if tbar_ok else f"T 型推杆不可用：{self._tbar_block_reason()}")
+        # 把"为什么用不了 / 有什么要注意"**写在界面上**，别只藏在 tooltip 里 ——
+        # 否则用户只看到一根拖不动的滑块，完全不知道要去 OBS 里开工作室模式
+        note = self._tbar_block_reason() if not tbar_ok else self._tbar_note()
+        self.tbar_hint.setText(note)
+        self.tbar_hint.setVisible(bool(note))
         for button in self._quick_buttons:
             button.setEnabled(self.store.studio_mode)
+
+    def _tbar_usable(self) -> bool:
+        """推杆此刻能不能用：工作室模式 + 协议支持 + 没被 OBS 拒过。"""
+        return (
+            self.store.studio_mode
+            and self.store.supports("SetTBarPosition")
+            and not self.store.is_unavailable("SetTBarPosition")
+        )
+
+    def _tbar_block_reason(self) -> str:
+        """**不能用**的原因，按"最该先解决的那一条"排。"""
+        if not self.store.supports("SetTBarPosition"):
+            return "当前 OBS 不支持 T 型推杆（需要 obs-websocket 5.x）"
+        if not self.store.studio_mode:
+            return "需要先在 OBS 里开启工作室模式（Studio Mode）"
+        if self.store.is_unavailable("SetTBarPosition"):
+            return self.store.unavailable_reason("SetTBarPosition") or "OBS 当前不接受推杆请求"
+        return ""
+
+    def _tbar_note(self) -> str:
+        """能用、但有前提或已知问题时的提示。
+
+        OBS 的 `ValidTBarTransition()` 明确排除 cut / stinger 两种转场，
+        不过它推杆时会**自动临时改用淡入淡出**，所以推杆本身仍然有效 ——
+        只是转场方式会被换掉，得说清楚，别让用户以为"我选的剪切怎么变淡入了"。
+        """
+        if self.store.tbar_ignored:
+            # OBS 收下请求却毫无反应（未修复的 OBS 侧缺陷，见 controller.TBAR_OBS_BUG_HINT）
+            return "OBS 收下了请求但没有反应（已知 OBS 侧缺陷），详见弹窗说明"
+        if self._is_cut_transition():
+            return "当前是「剪切」：推杆时 OBS 会自动改用淡入淡出"
+        return ""
 
     def _is_cut_transition(self) -> bool:
         """OBS 不给「剪切」这类瞬时转场做手动推杆（见 ValidTBarTransition）。"""
@@ -408,7 +438,7 @@ class _TransitionColumn(QWidget):
         self._tbar_timer.stop()
         self._tbar_pending = None
         position = self.tbar.value() / 100.0
-        if position >= 1.0 - TBAR_CLAMP:
+        if position >= 1.0 - P.TBAR_CLAMP:
             self.callbacks["tbar"](position, True)
         else:
             self.callbacks["tbar"](0.0, True)

@@ -542,12 +542,53 @@ def main() -> int:
     app.processEvents()
     check("事件确认后滑块归位", column.tbar.value() == 0, str(column.tbar.value()))
 
-    # 当前转场是「剪切」时给明确提示（OBS 的 ValidTBarTransition 排除 cut）
+    # 当前转场是「剪切」：OBS 的 ValidTBarTransition 排除 cut，
+    # 但它推杆时会自动临时改用淡入淡出 —— 所以推杆**仍然可用**，
+    # 只是要在界面上说清"转场方式会被换掉"，别让用户以为选错了。
     controller.store.set_current_transition("Cut")
     app.processEvents()
-    check("剪切转场时 tooltip 说明原因",
-          "剪切" in column.tbar.toolTip(), column.tbar.toolTip())
+    check("剪切时推杆仍可用（OBS 会自动改用淡入淡出）", column.tbar.isEnabled())
+    # 用 isHidden() 而不是 isVisible()：非工作室模式下整个转场列本身是隐藏的，
+    # isVisible() 会把"祖先隐藏"也算进来，断不到提示自己的状态
+    check("剪切时界面上写明会改用淡入淡出",
+          "剪切" in column.tbar_hint.text() and not column.tbar_hint.isHidden(),
+          column.tbar_hint.text())
+
+    print("\n[9d2] 推杆不可用时必须在界面上说清原因（回归）")
     controller.store.set_current_transition("渐变")
+    controller.store.set_studio_mode(False)
+    app.processEvents()
+    check("非工作室模式下推杆不可用", not column.tbar.isEnabled())
+    check("界面上写明要开工作室模式",
+          "工作室模式" in column.tbar_hint.text() and not column.tbar_hint.isHidden(),
+          column.tbar_hint.text())
+    controller.store.set_studio_mode(True)
+    app.processEvents()
+    check("恢复工作室模式后推杆可用且提示消失",
+          column.tbar.isEnabled() and column.tbar_hint.isHidden(),
+          column.tbar_hint.text())
+    # 被 OBS 拒过（如 506）时的原因也要显出来
+    controller.store.mark_unavailable("SetTBarPosition", "OBS 端未开启工作室模式")
+    app.processEvents()
+    check("被 OBS 拒后推杆置灰", not column.tbar.isEnabled())
+    check("界面上显示 OBS 给的原因",
+          "未开启工作室模式" in column.tbar_hint.text(), column.tbar_hint.text())
+    controller.store.clear_unavailable("SetTBarPosition")
+    app.processEvents()
+    check("撤销降级后推杆恢复", column.tbar.isEnabled())
+
+    # OBS 收下请求却毫无反应（未修复的 OBS 侧缺陷）：推杆**仍可用**（不是错误，
+    # 只是 OBS 不理），但界面上要说清"为什么拖了没反应"
+    controller.store.set_tbar_ignored(True)
+    app.processEvents()
+    check("OBS 不理会时推杆仍可用（这不是我们的错，也不该锁死用户）",
+          column.tbar.isEnabled())
+    check("界面上说明是已知的 OBS 侧缺陷",
+          "OBS" in column.tbar_hint.text() and not column.tbar_hint.isHidden(),
+          column.tbar_hint.text())
+    controller.store.set_tbar_ignored(False)
+    app.processEvents()
+    check("恢复正常后提示消失", column.tbar_hint.isHidden(), column.tbar_hint.text())
     controller.store.set_transitioning(False)
     controller.store.set_studio_mode(False)
     app.processEvents()
@@ -659,6 +700,101 @@ def main() -> int:
     diag.clear()
     check("清空后无内容", diag.view.toPlainText() == "" and sum(diag._counts.values()) == 0)
     diag.close()
+
+    print("\n[10b] 诊断窗口：暂停滚动 / 待响应 / 失败帧（回归）")
+    diag2 = DiagnosticsWindow()
+    diag2.resize(600, 300)
+    diag2.show()
+    app.processEvents()
+    for i in range(80):
+        diag2.append("->", "request", {"requestType": f"Req{i}", "i": i})
+        diag2.append("<-", "response", {"requestType": f"Req{i}", "ok": True})
+    app.processEvents()
+    bar = diag2.view.verticalScrollBar()
+    check("内容够多，视图可滚动", bar.maximum() > 0, str(bar.maximum()))
+    # QPlainTextEdit 的 value 与 maximum 允许差 1（视口行高取整），别写死相等
+    check("默认跟随到底部", bar.value() >= bar.maximum() - 1, f"{bar.value()}/{bar.maximum()}")
+
+    # 线上问题：用户勾了"暂停滚动"，视图仍然一路跑到最底。
+    # 真因：`QPlainTextEdit.appendPlainText` 在**滚动条已经位于最底部**时会自己
+    # "跟随末尾"继续滚到底（实测 107→112），而用户勾暂停时正好就在底部。
+    # 所以只跳过后面那句 setValue(maximum()) 是拦不住的，必须把位置存下来再还原。
+    # ↓ 先测**在底部时暂停**这个真实场景（这是原缺陷能复现的唯一姿势）
+    check("前提：此刻视图位于最底部", bar.value() >= bar.maximum() - 1,
+          f"{bar.value()}/{bar.maximum()}")
+    diag2.pause_check.setChecked(True)
+    app.processEvents()
+    bottom_at_pause = bar.value()
+    for i in range(10):
+        diag2.append("->", "request", {"requestType": f"Tail{i}", "i": i})
+        diag2.append("<-", "response", {"requestType": f"Tail{i}", "ok": True})
+    app.processEvents()
+    check("**在底部勾暂停后不再跟随**（这正是之前的 bug）",
+          bar.value() == bottom_at_pause and bar.value() < bar.maximum(),
+          f"{bottom_at_pause} -> {bar.value()} (max={bar.maximum()})")
+    check("暂停时状态栏有提示", "已暂停滚动" in diag2.status_label.text(),
+          diag2.status_label.text())
+    check("暂停期间新内容仍在记录", "Tail9" in diag2.view.toPlainText())
+
+    # 再从中间暂停，验证位置被原样保住
+    diag2.pause_check.setChecked(False)
+    app.processEvents()
+    bar.setValue(bar.maximum() // 2)
+    parked = bar.value()
+    diag2.pause_check.setChecked(True)
+    app.processEvents()
+    for i in range(10):
+        diag2.append("->", "request", {"requestType": f"Mid{i}", "i": i})
+        diag2.append("<-", "response", {"requestType": f"Mid{i}", "ok": True})
+    app.processEvents()
+    check("中途勾暂停时位置原样保住", bar.value() == parked,
+          f"{parked} -> {bar.value()}")
+
+    diag2.to_bottom_btn.click()
+    app.processEvents()
+    check("点「回到底部」恢复跟随",
+          bar.value() >= bar.maximum() - 1 and not diag2.pause_check.isChecked(),
+          f"{bar.value()}/{bar.maximum()} paused={diag2.pause_check.isChecked()}")
+
+    print("\n[10c] 诊断窗口：待响应与失败帧（回归）")
+    diag2.pause_check.setChecked(False)
+    diag2.clear()
+    # 失败是**协议原样**的响应帧（requestStatus.result=false），
+    # 之前记的是自定义的 {requestType, code, comment}，用户按 requestStatus.code 找不到，
+    # 会误以为"OBS 根本没回响应"。
+    diag2.append("->", "request", {"requestType": "SetTBarPosition", "requestData": {"position": 1.0}})
+    app.processEvents()
+    check("发出未回的请求会显示为待响应",
+          "待响应" in diag2.status_label.text()
+          and "SetTBarPosition" in diag2.status_label.text(),
+          diag2.status_label.text())
+    diag2.append("<-", "response", {
+        "requestType": "SetTBarPosition",
+        "requestStatus": {"result": False, "code": 506, "comment": "Studio Mode is not active"},
+    })
+    app.processEvents()
+    check("收到响应后不再算待响应", "待响应" not in diag2.status_label.text(),
+          diag2.status_label.text())
+    check("失败响应计入「失败」", diag2._failed == 1, str(diag2._failed))
+    text = diag2.view.toPlainText()
+    check("失败帧里能看到 requestStatus 与 code",
+          "requestStatus" in text and "506" in text, text[:120])
+
+    # 「只看错误」不能只认 kind=="error"，否则最该看的那一类反而被过滤掉
+    diag2.clear()
+    diag2.errors_only_check.setChecked(True)
+    rows = diag2.view.blockCount()   # 空文档本来就有 1 个 block，要跟追加前比
+    diag2.append("<-", "response", {"requestType": "GetStats", "ok": True})
+    check("只看错误时普通响应仍被过滤", diag2.view.blockCount() == rows,
+          f"{rows} -> {diag2.view.blockCount()}")
+    diag2.append("<-", "response", {
+        "requestType": "SetTBarPosition",
+        "requestStatus": {"result": False, "code": 506},
+    })
+    check("只看错误时能看到失败响应", diag2.view.blockCount() > rows,
+          str(diag2.view.blockCount()))
+    diag2.errors_only_check.setChecked(False)
+    diag2.close()
 
     print("\n[11] O2 高 DPI 适配")
     from PySide6.QtCore import QRect

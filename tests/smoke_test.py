@@ -736,15 +736,24 @@ def main() -> int:
     diag.attach(controller.worker)
     controller.connect()
     wait_until(lambda: controller.store.connection_state == CONNECTED, 15, app)
-    # 主动造一个事件，保证事件帧一定被记到（不依赖后台电平表）
-    server10.broadcast_threadsafe("CurrentProgramSceneChanged", {"sceneName": "开场"})
-    wait_until(lambda: diag._counts["event"] > 0, 5, app)
+    # 主动造一个事件。注意**要反复广播**：事件通道是第二条 websocket，
+    # 它是在控制通道连上之后才建的，`CONNECTED` 到 `EventClient` 订阅生效之间
+    # 有一个窗口 —— 只播一次很容易恰好落在窗口里（事件没人订阅就丢了）。
+    deadline = time.time() + 10
+    while time.time() < deadline and diag._counts["event"] == 0:
+        server10.broadcast_threadsafe("CurrentProgramSceneChanged", {"sceneName": "开场"})
+        for _ in range(8):
+            app.processEvents()
+            time.sleep(0.02)
     for _ in range(20):
         app.processEvents()
         time.sleep(0.02)
     check("诊断窗口收到请求帧", diag._counts["request"] > 0, str(diag._counts))
     check("诊断窗口收到响应帧", diag._counts["response"] > 0, str(diag._counts))
     check("诊断窗口收到事件帧", diag._counts["event"] > 0, str(diag._counts))
+    # 不变量：每个发出去的请求都必须有着落（响应或错误帧），
+    # 不能在诊断窗口里留下"有请求、之后什么都没有"的悬空现象
+    check("没有悬空未响应的请求", not diag._pending, str(diag._pending))
     # 关闭 = 断开信号，之后不应再记账
     diag.detach(controller.worker)
     # 先把 detach 之前就已排队的跨线程信号冲干净，再取基线
@@ -1014,6 +1023,137 @@ def main() -> int:
     controller.set_studio_mode(False)
     wait_until(lambda: not controller.store.studio_mode, 5, app)
 
+    print("\n[16c] 两边工作室模式不同步时，推杆必须自愈并说清原因（回归）")
+    # 用户报的现场：推杆怎么拖都没反应，**OBS 侧推杆纹丝不动**。
+    # 服务端实现（obs-websocket RequestHandler_Transitions.cpp）里
+    # SetTBarPosition 第一件事就是 `if (!obs_frontend_preview_program_mode_active())
+    # return Error(StudioModeNotActive)` —— 只要两边对工作室模式的认知不同步，
+    # 请求就全被 506 拒掉，而客户端如果只信本地状态，界面上的推杆会一直是"可用但没用"。
+    # 这里直接制造这种不同步，验证客户端能纠正自己。
+    active.state.studio_mode = False          # OBS 侧其实没开
+    controller.store.set_studio_mode(True)    # 本地却以为开着
+    controller.store.clear_unavailable("SetTBarPosition")
+    app.processEvents()
+    # 同时抓一份原始帧：验证"失败也记成协议原样的响应帧"（含 requestStatus.code）
+    frames: list[tuple[str, str, object]] = []
+    controller.worker.raw_trace.connect(
+        lambda direction, kind, payload: frames.append((direction, kind, payload))
+    )
+    before_caps = active.requests.count("GetStudioModeEnabled")
+    controller.set_tbar_position(0.5, False)
+    check("本地先乐观推到 0.5", controller.store.tbar_position == 0.5,
+          str(controller.store.tbar_position))
+    # 等"位置被纠回 0" —— 只有拒绝纠错路径会这么做。
+    # 不能等 is_unavailable：工作室模式同步那边也会把它置上，那样等到的
+    # 可能不是拒绝路径，断言就变成了猜时序。
+    check("被 OBS 拒后位置被纠回 0",
+          wait_until(lambda: controller.store.tbar_position == 0.0, 5, app),
+          str(controller.store.tbar_position))
+    check("推杆被标成不可用",
+          controller.store.is_unavailable("SetTBarPosition"),
+          str(controller.store.is_unavailable("SetTBarPosition")))
+    check("原因里讲清了是工作室模式",
+          "工作室模式" in controller.store.unavailable_reason("SetTBarPosition"),
+          controller.store.unavailable_reason("SetTBarPosition"))
+    check("不再假装在转场", not controller.store.transitioning,
+          str(controller.store.transitioning))
+    # 排障关键：失败必须也进诊断窗口，而且是**协议原样**的 requestStatus 形状。
+    # 用户按 requestStatus.code 去找却找不到，就会误判成"OBS 没回响应"。
+    failed_frames = [
+        payload for _, kind, payload in frames
+        if kind == "response" and isinstance(payload, dict)
+        and isinstance(payload.get("requestStatus"), dict)
+        and payload["requestStatus"].get("result") is False
+    ]
+    check("失败也记成协议原样的响应帧（含 requestStatus.code）",
+          any(p["requestStatus"].get("code") == 506 for p in failed_frames),
+          str(failed_frames[:1]))
+    check("回读了工作室模式（准备纠正本地状态）",
+          wait_until(lambda: active.requests.count("GetStudioModeEnabled") > before_caps, 5, app),
+          str(active.requests.count("GetStudioModeEnabled") - before_caps))
+    check("本地工作室模式被纠正为关闭",
+          wait_until(lambda: not controller.store.studio_mode, 5, app),
+          str(controller.store.studio_mode))
+    # 真正打开工作室模式后，推杆应当重新可用
+    controller.set_studio_mode(True)
+    wait_until(lambda: active.state.studio_mode, 5, app)
+    wait_until(lambda: controller.store.studio_mode, 5, app)
+    check("工作室模式恢复后推杆重新可用",
+          wait_until(lambda: not controller.store.is_unavailable("SetTBarPosition"), 5, app),
+          str(controller.store.is_unavailable("SetTBarPosition")))
+    check("恢复后位置归零、状态干净",
+          controller.store.tbar_position == 0.0 and not controller.store.transitioning)
+    controller.set_studio_mode(False)
+    # 这里要等的是**服务端确认 + 可用性跟着更新**，不能等本地乐观值
+    check("关闭工作室模式时主动收起推杆并给出原因",
+          wait_until(lambda: controller.store.is_unavailable("SetTBarPosition"), 5, app)
+          and "工作室模式" in controller.store.unavailable_reason("SetTBarPosition"),
+          controller.store.unavailable_reason("SetTBarPosition"))
+    controller.store.clear_unavailable("SetTBarPosition")
+
+    print("\n[16d] OBS 收下推杆却毫无反应时，必须自己发现并说清原因（回归）")
+    # OBS ≥29.1 的缺陷（obs-studio issue #11372 / PR #13143 未合入）：
+    # SetTBarPosition **正常返回 code 100**，但 OBS 端什么都不会发生。
+    # "请求成功"和"功能可用"是两件事，只看回执发现不了，只能从结果反推。
+    controller.disconnect()
+    wait_until(lambda: controller.store.connection_state != CONNECTED, 5, app)
+    port_silent = free_port()
+    silent = FakeObsServer(host="127.0.0.1", port=port_silent, tbar_silent=True)
+    silent.start()
+    controller.config.connection = ConnectionConfig(
+        host="127.0.0.1", port=port_silent, password=DEFAULT_PASSWORD
+    )
+    controller.connect()
+    wait_until(lambda: controller.store.connection_state == CONNECTED, 15, app)
+    wait_until(lambda: controller.store.supports("SetTBarPosition"), 8, app)
+    controller.set_studio_mode(True)
+    wait_until(lambda: silent.state.studio_mode, 5, app)
+    wait_until(lambda: controller.store.studio_mode, 5, app)
+    controller.store.set_tbar_ignored(False)
+    # 抓一下弹给用户的文案：必须点出这是 OBS 侧的已知缺陷 + 给出变通办法
+    alerts: list[tuple[str, str]] = []
+    controller.store.error_raised.connect(
+        lambda title, detail: alerts.append((title, detail))
+    )
+    scene_before = silent.state.current_scene
+    preview_before = silent.state.preview_scene
+    controller.set_tbar_position(1.0, True)      # 推到底松手
+    for _ in range(20):
+        app.processEvents()
+        time.sleep(0.02)
+    check("OBS 回了成功（code 100），所以不是协议层的问题",
+          not controller.store.transitioning and silent.state.current_scene == scene_before,
+          f"{silent.state.current_scene}")
+    check("**能自己发现「请求成功但没效果」**",
+          wait_until(lambda: controller.store.tbar_ignored, 8, app),
+          str(controller.store.tbar_ignored))
+    check("没有把成功当失败（推杆仍可用）",
+          not controller.store.is_unavailable("SetTBarPosition"))
+    check("弹窗说清了这是 OBS 侧缺陷并给了上游号",
+          any("11372" in detail or "13143" in detail for _, detail in alerts),
+          str(alerts[:1]))
+    check("弹窗给了变通办法", any("鼠标" in detail or "转场动画" in detail
+                                  for _, detail in alerts),
+          str(alerts[:1]))
+    # 有动静的情况不能误判
+    controller.store.set_tbar_ignored(False)
+    silent.tbar_silent = False
+    controller.set_tbar_position(0.5, False)
+    wait_until(lambda: silent.state.tbar_transitioning, 5, app)
+    controller.set_tbar_position(1.0, True)
+    wait_until(lambda: silent.state.current_scene == preview_before, 5, app)
+    check("OBS 真动了就不会误报", not controller.store.tbar_ignored,
+          str(controller.store.tbar_ignored))
+    # 这一段换了服务器，后面的段落还要用回原来那台 —— 不换回来会把它们全带崩
+    controller.disconnect()
+    wait_until(lambda: controller.store.connection_state != CONNECTED, 5, app)
+    silent.stop()
+    controller.config.connection = ConnectionConfig(
+        host="127.0.0.1", port=port_n, password=DEFAULT_PASSWORD
+    )
+    controller.connect()
+    wait_until(lambda: controller.store.connection_state == CONNECTED, 15, app)
+
     print("\n[17] G5：快捷转场槽位（客户端侧，两步打包）")
     controller.set_studio_mode(True)
     wait_until(lambda: controller.store.studio_mode, 5, app)
@@ -1056,6 +1196,8 @@ def main() -> int:
     wait_until(lambda: bool(controller.store.media), 8, app)
     check("识别出媒体源", [m.name for m in controller.store.media] == ["媒体源2"],
           str([m.name for m in controller.store.media]))
+    # 时长来自 GetMediaInputStatus（低频那拍才拉），刚重连完还没轮到 —— 等它到
+    wait_until(lambda: controller.store.find_media("媒体源2").duration_ms > 0, 8, app)
     check("拿到时长（L2 进度条需要）",
           controller.store.find_media("媒体源2").duration_ms == 180000,
           str(controller.store.find_media("媒体源2")))

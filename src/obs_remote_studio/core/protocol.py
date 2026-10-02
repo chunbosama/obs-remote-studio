@@ -204,6 +204,11 @@ REQ_TRIGGER_STUDIO_MODE_TRANSITION = "TriggerStudioModeTransition"
 # 用 SceneTransitionStarted/Ended 事件来校准，不要试图去"回读"。
 REQ_SET_TBAR_POSITION = "SetTBarPosition"
 
+# OBS 判定"推到底了"带 10% 量程的容差（window-basic-main-transitions.cpp 里
+# T_BAR_CLAMP = T_BAR_PRECISION / 10）。客户端必须用同一个阈值，
+# 否则会出现"OBS 觉得到了、我觉得没到"的状态错位。UI 与控制器共用这一个定义。
+TBAR_CLAMP = 0.1
+
 # L：媒体源控制
 REQ_GET_MEDIA_INPUT_STATUS = "GetMediaInputStatus"
 REQ_TRIGGER_MEDIA_INPUT_ACTION = "TriggerMediaInputAction"
@@ -284,6 +289,11 @@ ERR_RESOURCE_NOT_AVAILABLE = 604  # 请求合法，但目标资源当前不可�
 # 这些都是**运行时的正常业务状态**（例如这台机器没配回放缓冲、没有摄像头），
 # 不该当成"操作失败"弹框打扰用户，只在 debug 日志里留痕即可。
 RESOURCE_ERROR_CODES = frozenset({600, 601, 602, 603, 604, 605})
+# 506 StudioModeNotActive：obs-websocket 里 SetTBarPosition / TriggerStudioModeTransition
+# 第一件事就是检查工作室模式，没开就直接回这个码（见 RequestHandler_Transitions.cpp）。
+# 它是**用户可纠正**的状态错误（去 OBS 里开工作室模式即可），所以既不能静默吞掉、
+# 也不该按"操作失败"糊一个弹框了事 —— 得把原因讲清楚。
+ERR_STUDIO_MODE_NOT_ACTIVE = 506
 
 # ---------------------------------------------------------------- 名称转换
 _CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")

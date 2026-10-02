@@ -59,6 +59,35 @@ MEDIA_PENDING_TIMEOUT_S = 3.0
 # 于是"陈旧数据后到"是常态而非意外，只能靠时间窗口仲裁。
 INTENT_WINDOW_S = 2.0
 
+# 事件通道是独立的第二条 websocket，可能单独建失败（服务器正在关、网络抖动…）。
+# 失败后要带退避重试，否则一次失败就永远收不到事件了。
+EVENT_RETRY_MAX_ATTEMPTS = 4
+
+# G4：推杆"推到底松手"之后，等多久还没任何转场动静就判定 OBS 没理会这次推杆
+TBAR_NO_EFFECT_CHECK_MS = 3000
+
+# G4：OBS 收下推杆请求却毫无反应 —— 这是 **OBS 自己的缺陷**，不是本客户端的。
+# 依据（都已核实到上游）：
+#   · obs-studio issue #11372（2024-10 提交，至今 open）：
+#     `obs_frontend_set_tbar_position()` 不再更新 T 型推杆控件；
+#     29.0.2 正常，**29.1.0-beta1 起坏掉**，到 32.1.2 仍未修，
+#     并明确写着 "affects the OBS WebSocket plugin as well"。
+#   · obs-studio PR #13143（尚未合入）的自述：
+#     "without it, it is impossible to perform T-bar transitions through the API"，
+#     因为结束转场时读的是推杆控件位置，"which never gets set by this function"。
+#   · obs-websocket issue #1211：多位用户描述同一现象 ——
+#     "The command is accepted and returns code 100 but nothing happens
+#      unless I first move the T-Bar with my mouse off the left position."
+# 换句话说：请求合法性没问题（OBS 回 100），但 OBS 端不会真的动。
+# 客户端能做的就是**把这件事讲清楚**，别再让用户拖一根被忽略的控件。
+TBAR_OBS_BUG_HINT = (
+    "OBS 收下了推杆请求但没有任何反应 —— 这是 OBS 29.1 起的一个已知缺陷，不是本软件的问题："
+    "obs_frontend_set_tbar_position() 不再更新 T 型推杆控件，而结束转场时读的正是该控件的值，"
+    "所以通过 API 根本完不成手动转场（obs-studio issue #11372，修复 PR #13143 尚未合入）。\n"
+    "可以这样绕：先在 OBS 里用鼠标把 T 型推杆拖动一下让它「激活」，再试远程推杆；"
+    "或者直接用面板上的「转场动画」按钮 / 快捷转场。"
+)
+
 # 这些请求按"逐源探测"使用，失败时只记日志、不弹框
 _AUDIO_GET_REQUESTS = frozenset(
     {
@@ -113,6 +142,20 @@ class Controller(QObject):
         self._transition_watchdog = QTimer(self)
         self._transition_watchdog.setSingleShot(True)
         self._transition_watchdog.timeout.connect(self._on_transition_watchdog)
+        # T 型推杆是否正处于"一次拖拽"中（只影响日志详略）
+        self._tbar_in_drag = False
+
+        # G4：推杆"有没有被 OBS 理会"的校验
+        self._tbar_effect_timer = QTimer(self)
+        self._tbar_effect_timer.setSingleShot(True)
+        self._tbar_effect_timer.timeout.connect(self._on_tbar_effect_check)
+        self._tbar_check_scene = ""
+
+        # 事件通道重建（退避重试）
+        self._event_retry_timer = QTimer(self)
+        self._event_retry_timer.setSingleShot(True)
+        self._event_retry_timer.timeout.connect(self._on_event_retry)
+        self._event_retry_attempt = 0
 
         # L：媒体状态查询（响应不带 inputName，按请求顺序关联）
         self._media_timer = QTimer(self)
@@ -247,6 +290,7 @@ class Controller(QObject):
         # 能力列表来自握手时那次 GetVersion，必须在 refresh_all 之前就位，
         # 否则 _refresh_transitions 只能靠"发了被拒"来试错。
         self.store.set_capabilities(info.get("available_requests") or [])
+        self.store.set_tbar_ignored(False)
         self._transition_fallback_used = False
         # 新连接：录制目录要重新问（可能换了台机器），RTT 样本也从头算
         self._record_directory = ""
@@ -311,11 +355,55 @@ class Controller(QObject):
 
     @Slot(str)
     def _on_event_link_failed(self, message: str) -> None:
+        """事件通道（第二条 websocket）没能建立。
+
+        控制指令还能用，只是收不到 OBS 端的变化 —— 所以要告诉用户。
+        但**正在断开 / 已经断开时不要再弹这一条**：那种失败是上一次连接的残响
+        （服务器都在关了，重连当然失败），此时提示"变化不会同步"只会让人困惑。
+        """
         logger.warning("事件通道建立失败：%s", message)
-        self.store.error_raised.emit(
-            "事件订阅失败",
-            f"控制指令仍可用，但 OBS 端的变化不会自动同步到本客户端（{message}）。",
-        )
+        if self.store.connection_state == CONNECTED:
+            self.store.error_raised.emit(
+                "事件订阅失败",
+                f"控制指令仍可用，但 OBS 端的变化不会自动同步到本客户端（{message}）。"
+                "正在自动重试。",
+            )
+        else:
+            logger.debug("非连接态下不弹提示（属上一条连接的残响）")
+        # 注意：**不管在什么状态都要安排重试**。
+        # 事件通道是在 `connected` 之前就开始建的，失败时状态可能还没到 CONNECTED；
+        # 那时如果直接 return，这条连接就再也不会重试、永远收不到事件了。
+        self._schedule_event_retry()
+
+    def _schedule_event_retry(self) -> None:
+        """事件通道建失败就带退避重试。
+
+        以前这里是一次性的：建不上就再也没事件了，场景/录制这些依赖事件的显示项
+        会一直不动（要等用户手动重连）。控制通道还在就不该放弃。
+        """
+        if self._event_retry_attempt >= EVENT_RETRY_MAX_ATTEMPTS:
+            logger.warning("事件通道重试 %d 次仍失败，不再重试", self._event_retry_attempt)
+            return
+        delay = min(1000 * (2 ** self._event_retry_attempt), 15000)
+        self._event_retry_attempt += 1
+        logger.info("第 %d 次重建事件通道，%d ms 后重试", self._event_retry_attempt, delay)
+        self._event_retry_timer.start(delay)
+
+    @Slot()
+    def _on_event_retry(self) -> None:
+        # 正在连接中也允许重试（事件通道就是那个阶段建的）；
+        # 主动断开时 _stop_polling 已经把定时器停了，这里再兜一道。
+        if self.store.connection_state == DISCONNECTED:
+            return
+        self._worker.retry_event_link.emit()
+
+    @Slot()
+    def _on_event_link_ready(self) -> None:
+        """事件通道就绪（首次或重试成功）。"""
+        if self._event_retry_attempt:
+            logger.info("事件通道已重建成功（此前重试 %d 次）", self._event_retry_attempt)
+        self._event_retry_attempt = 0
+        self._event_retry_timer.stop()
 
     def _schedule_reconnect(self) -> bool:
         """返回 True 表示已安排重连。"""
@@ -349,6 +437,10 @@ class Controller(QObject):
         self._heartbeat_timer.stop()
         self._heartbeat_pending = False
         self._transition_watchdog.stop()
+        # 主动断开/掉线时别再去重建事件通道了
+        self._event_retry_timer.stop()
+        self._event_retry_attempt = 0
+        self._tbar_effect_timer.stop()
         self._frame_queue.clear()
         self._frame_pending.clear()
         self._pending_audio.clear()
@@ -1076,13 +1168,36 @@ class Controller(QObject):
         `release=True` 表示松手 —— 推到底就完成转场，中途松手 OBS 会自己回退。
         """
         if not self.store.studio_mode:
+            logger.warning("T 型推杆未下发：本地认为不在工作室模式")
             return
         if not self.send_if_supported(
             P.REQ_SET_TBAR_POSITION,
             {"position": float(position), "release": bool(release)},
         ):
+            # 这条日志很关键：用户报"推杆没反应"时，先看这里就能区分
+            # "根本没发出去"（能力探测没过）还是"发了但 OBS 不接受"
+            logger.warning(
+                "T 型推杆未下发：能力探测不通过（supports=%s, unavailable=%s）",
+                self.store.supports(P.REQ_SET_TBAR_POSITION),
+                self.store.is_unavailable(P.REQ_SET_TBAR_POSITION),
+            )
             return
+        # 一次拖拽只在"第一下"和"松手"各记一条 INFO，中间帧记 DEBUG，免得刷屏
+        was_dragging = self._tbar_in_drag
+        self._tbar_in_drag = not release
+        if release or not was_dragging:
+            logger.info("T 型推杆下发：position=%.3f release=%s", position, release)
+        else:
+            logger.debug("T 型推杆下发：position=%.3f", position)
         self.store.set_tbar_position(position)
+        if release:
+            # 松手了：只有"往完成端推"的那次才需要验证 OBS 有没有反应
+            if position >= 1.0 - P.TBAR_CLAMP:
+                self._arm_tbar_effect_check()
+        else:
+            if not was_dragging:
+                # 新一次拖拽开始，清掉上一轮"OBS 没理会"的判定
+                self.store.set_tbar_ignored(False)
         # 推杆是在**有意识地延长**这次转场，看门狗要跟着往后推，
         # 否则慢慢推的时候会被兜底逻辑打断
         if self.store.transitioning:
@@ -1610,7 +1725,22 @@ class Controller(QObject):
         self.store.set_studio_mode(self._reconcile_flag(self._studio_intent, reported))
         if self._intent_expired(self._studio_intent) or reported == self.store.studio_mode:
             self._studio_intent = None
+        self._sync_tbar_availability()
         self._debounced(self._items_timer)
+
+    def _sync_tbar_availability(self) -> None:
+        """工作室模式一变，推杆的可用性就得跟着变。
+
+        OBS 侧 `SetTBarPosition` 要求工作室模式；之前被 506 拒过就把推杆标成了
+        不可用，这里在工作室模式打开时撤销降级，让它重新可用。
+        """
+        if self.store.studio_mode:
+            self.store.clear_unavailable(P.REQ_SET_TBAR_POSITION)
+        elif not self.store.is_unavailable(P.REQ_SET_TBAR_POSITION):
+            # 关掉工作室模式时主动收起推杆并说明原因（不用等被拒一次才发现）
+            self.store.mark_unavailable(
+                P.REQ_SET_TBAR_POSITION, "需要 OBS 开启工作室模式（Studio Mode）"
+            )
 
     def _refresh_transitions(self) -> None:
         """按服务端能力选请求名：优先 GetSceneTransitionList（5.1+），退回 GetTransitionList（5.0）。"""
@@ -1662,6 +1792,7 @@ class Controller(QObject):
             self.store.set_transition_duration(int(duration))
 
     def _event_scene_transition_started(self, data) -> None:
+        self._clear_tbar_effect_check()   # 有动静了，说明 OBS 理会了推杆
         self.store.set_transitioning(True)
         self._arm_transition_watchdog()
 
@@ -1699,6 +1830,7 @@ class Controller(QObject):
         if self._intent_expired(self._studio_intent) or reported == enabled:
             self._studio_intent = None
         self.store.set_studio_mode(enabled)
+        self._sync_tbar_availability()
         self._debounced(self._items_timer)
         if enabled:
             self.send(P.REQ_GET_SCENE_LIST)
@@ -1837,6 +1969,18 @@ class Controller(QObject):
             self._mute_all_pending = max(0, self._mute_all_pending - 1)
             logger.debug("批量静音中 %s 失败：%s", message)
             return
+        if request_type == P.REQ_SET_TBAR_POSITION:
+            self._on_tbar_rejected(code, message)
+            return
+        if request_type == P.REQ_TRIGGER_STUDIO_MODE_TRANSITION and (
+            code == P.ERR_STUDIO_MODE_NOT_ACTIVE
+        ):
+            # 同一处服务端检查：转场按钮也要求工作室模式。
+            # 本地以为开着、OBS 其实没开时，按钮会一直"点了没反应"，这里纠回去。
+            logger.warning("转场请求被拒：OBS 端未开启工作室模式")
+            self._raise_error_once("转场失败：OBS 端未开启工作室模式，已同步纠正本地状态")
+            self._resync_studio_mode()
+            return
         # 204 的文案就是 "... Your request type is not valid"，
         # 所以"是否名字不对"必须先判，否则下面那段回退永远不会被执行到。
         rejected = code == P.ERR_INVALID_REQUEST or (
@@ -1897,6 +2041,64 @@ class Controller(QObject):
                 self.store.set_connection_state(DISCONNECTED, "连接中断")
         self._worker.request_disconnect.emit()  # 清理残留连接
 
+    # ---- G4：推杆有没有被 OBS 理会 ----
+    def _arm_tbar_effect_check(self) -> None:
+        """记下当前场景，过几秒看有没有转场动静。
+
+        为什么要专门查这件事：OBS ≥29.1 存在一个未修复的缺陷 ——
+        `SetTBarPosition` 会**正常返回 code 100**，但 OBS 端什么都不会发生
+        （详见 TBAR_OBS_BUG_HINT 上方的说明）。请求成功 ≠ 功能可用，
+        只看回执根本发现不了，所以只能从"结果"反推。
+        """
+        self._tbar_check_scene = self.store.current_scene
+        self._tbar_effect_timer.start(TBAR_NO_EFFECT_CHECK_MS)
+
+    @Slot()
+    def _on_tbar_effect_check(self) -> None:
+        if self.store.transitioning or self.store.current_scene != self._tbar_check_scene:
+            return  # 有动静，OBS 是理会的
+        logger.warning("推杆请求返回成功，但 OBS 端没有任何转场动作 —— 判定为已知的 OBS 侧缺陷")
+        self.store.set_tbar_ignored(True)
+        self.store.error_raised.emit("T 型推杆未生效", TBAR_OBS_BUG_HINT)
+
+    def _clear_tbar_effect_check(self) -> None:
+        self._tbar_effect_timer.stop()
+
+    def _on_tbar_rejected(self, code: int, message: str) -> None:
+        """OBS 拒绝了推杆请求 —— 必须当场纠正，不能只弹一下就算了。
+
+        `SetTBarPosition` 的服务端实现第一件事就是检查工作室模式
+        （obs-websocket `RequestHandler_Transitions.cpp`：
+        `if (!obs_frontend_preview_program_mode_active()) return Error(StudioModeNotActive)`）。
+        客户端如果只信本地的 `studio_mode`，两边一旦不同步，表现就是
+        **怎么拖都没反应、OBS 侧推杆纹丝不动**：请求全被拒，界面上推杆却还是可用的。
+
+        所以这里三件事一起做：把推杆标成不可用并写清原因、把本地转场态收回、
+        回读一次工作室模式让两边对上。
+        """
+        reason = self._studio_reject_reason(code, message, "OBS 端未开启工作室模式")
+        logger.warning("推杆请求被 OBS 拒绝：%s", reason)
+        self.store.mark_unavailable(P.REQ_SET_TBAR_POSITION, reason)
+        # 别再假装在转场 —— 请求根本没生效
+        self._transition_watchdog.stop()
+        self.store.set_transitioning(False)
+        self.store.set_tbar_position(0.0)
+        self._raise_error_once(f"T 型推杆不可用：{reason}")
+        if code == P.ERR_STUDIO_MODE_NOT_ACTIVE:
+            self._resync_studio_mode()
+
+    def _studio_reject_reason(self, code: int, message: str, studio_hint: str) -> str:
+        if code == P.ERR_STUDIO_MODE_NOT_ACTIVE:
+            return f"{studio_hint}，已同步纠正本地状态"
+        return f"OBS 拒绝请求（code {code}）：{message}"
+
+    def _resync_studio_mode(self) -> None:
+        """回读工作室模式，让界面与 OBS 真正一致。
+
+        不回读的话，本地会一直以为自己在演播室模式里，推杆也就一直是"可用但没用"。
+        """
+        self.send_if_supported(P.REQ_GET_STUDIO_MODE_ENABLED)
+
     def _raise_error_once(self, detail: str, window_s: float = 10.0) -> None:
         """同一条错误在 window_s 内只提示一次，避免轮询类请求刷屏。"""
         now = time.monotonic()
@@ -1912,6 +2114,7 @@ class Controller(QObject):
         w.connect_failed.connect(self._on_connect_failed)
         w.disconnected.connect(self._on_disconnected)
         w.event_link_failed.connect(self._on_event_link_failed)
+        w.event_link_ready.connect(self._on_event_link_ready)
         w.event_received.connect(self._on_event)
         w.result_ready.connect(self._on_result)
         w.request_failed.connect(self._on_request_failed)
