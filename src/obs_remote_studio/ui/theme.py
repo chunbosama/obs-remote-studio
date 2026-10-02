@@ -139,20 +139,18 @@ def color(key: str) -> str:
     return THEMES[_current][key]
 
 
-def render_stylesheet(template: str) -> str:
+def render_stylesheet(template: str, extra: dict[str, str] | None = None) -> str:
     """把 QSS 模板里的 @TOKEN@ 换成当前主题的颜色。
+
+    `extra` 用来注入非颜色的东西（目前是数字框箭头图片的绝对路径），
+    它和颜色一样在「残留标记」检查之前替换掉 —— 否则会被当成漏掉的颜色标记报错。
 
     故意不用 str.format：QSS 自身的花括号会和格式化冲突。
     """
-    colors = THEMES[_current]
-    missing = [key for key in colors if f"@{key}@" not in template]
-    if missing:
-        # 模板里没用到不算错，但反过来（模板有、配色缺）要报
-        pass
     text = template
-    for key, value in colors.items():
+    for key, value in {**(extra or {}), **THEMES[_current]}.items():
         text = text.replace(f"@{key}@", value)
     leftovers = {token for token in text.split("@") if token.isupper() and "_" in token}
     if leftovers:
-        raise KeyError(f"QSS 模板里有未定义的颜色标记：{sorted(leftovers)}")
+        raise KeyError(f"QSS 模板里有未定义的标记：{sorted(leftovers)}")
     return text

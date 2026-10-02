@@ -241,6 +241,38 @@ QSpinBox::down-button, QDoubleSpinBox::down-button {
     border: none;
     width: 14px;
 }
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+    background: @BUTTON_HOVER@;
+}
+QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed,
+QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {
+    background: @BUTTON_PRESSED@;
+}
+/* 增减按钮的 ↑ / ↓ **必须自己画**：只要给 ::up-button/::down-button 写了样式，
+   Qt 就不再绘制原生箭头（不写 image 就什么都不画），
+   表现正是「按钮可见、可点，但看不到箭头」。
+   为什么用图片而不是画三角：Qt 的 QSS 不会像浏览器那样斜切边框角 ——
+   实测四种边框写法（带/不带 width·height、只留一条边、放大到 6px）渲染出来
+   都是同一块 6×4 实心小块。所以改用字体渲染的 ↑ / ↓
+   （见 ui/spin_arrows.py；图片按当前主题现画，路径由 render_stylesheet 注入）。 */
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    image: url("@SPIN_UP_IMAGE@");
+    width: 12px;
+    height: 12px;
+}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    image: url("@SPIN_DOWN_IMAGE@");
+    width: 12px;
+    height: 12px;
+}
+/* 到上下限时按钮置灰，箭头也要跟着变暗，否则"灰按钮 + 亮箭头"自相矛盾 */
+QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {
+    image: url("@SPIN_UP_IMAGE_DISABLED@");
+}
+QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {
+    image: url("@SPIN_DOWN_IMAGE_DISABLED@");
+}
 
 /* 弹出层是独立顶层窗口，不继承上面的颜色，必须显式写死 */
 QComboBox QAbstractItemView {

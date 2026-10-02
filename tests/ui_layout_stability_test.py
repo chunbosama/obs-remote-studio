@@ -125,7 +125,18 @@ def main() -> int:
 
     frames = 0
     controller.store.frame_ready.connect(lambda *_: None)
-    pump(app, 0.6)  # 先让首帧落地
+    # 取基线前必须等「连接后的首轮填充」落地：来源列表与混音器推子行一填上，
+    # 这两个面板的最小宽度就会（合法地）变大，窗口最小宽度从 666 跳到 853。
+    # 原来这里写死 pump(0.6)，而填充实测在 0.4~1.2s 之间抖动 ——
+    # 采样点正好卡在窗口里，于是时红时绿（曾因此误判成本次箭头改动引入的布局漂移）。
+    # 改成等数据到位，而不是赌一个固定延时；测试要盯的是"之后还会不会持续漂移"。
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        if controller.store.scene_items and controller.store.audio_inputs:
+            break
+        app.processEvents()
+        time.sleep(0.02)
+    pump(app, 0.6)  # 再给布局一点时间稳定
     before = snapshot(window)
     frames = server.state.screenshot_count
 

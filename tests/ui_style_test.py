@@ -94,6 +94,29 @@ def brightness(widget: QWidget) -> tuple[float, float]:
     return (total / count if count else -1.0, peak)
 
 
+def spin_button_span(widget: QWidget, top: bool) -> tuple[float, float]:
+    """增减按钮区域（右侧 16px，上半=上按钮 / 下半=下按钮）的 (最暗, 最亮)。
+
+    **为什么不能用 QStyle.subControlRect 来定位**：QSS 一旦接管子控件，
+    Fusion 的 subControlRect 会返回退化矩形（实测高度是 -1），拿它做断言会误判。
+    所以直接按像素扫右侧条带 —— 按钮宽 14px，扫 16px 一定包住。
+
+    **为什么看亮度"跨度"而不是"有没有亮像素"**：深色主题箭头（#b0b0b0）比按钮底色亮，
+    浅色主题箭头（#5f6771）比底色暗，写死某一头在另一套主题下必然误判。
+    按钮底色是纯色，因此"跨度大"就等价于"上面画了东西"。
+    """
+    image = widget.grab().toImage()
+    width, height = image.width(), image.height()
+    half = height // 2
+    y_start, y_end = (0, half) if top else (half, height)
+    values = [
+        QColor(image.pixel(x, y)).lightnessF() * 255
+        for y in range(y_start, y_end)
+        for x in range(max(0, width - 16), width)
+    ]
+    return (min(values), max(values)) if values else (-1.0, -1.0)
+
+
 def main() -> int:
     tmp_dir = tempfile.mkdtemp(prefix="obsrs-ui-")
     QSettings.setDefaultFormat(QSettings.IniFormat)
@@ -133,6 +156,42 @@ def main() -> int:
     check("弹出层是深色底", 0 <= mean < 110, f"平均亮度 {mean:.0f}")
     check("弹出层文字可见（有亮色像素）", peak > 150, f"最亮 {peak:.0f}")
     combo.hidePopup()
+
+    print("\n[2b] 输入框的增减按钮：↑ / ↓ 必须画得出来（回归）")
+    # 现象：设置里所有数字框的上下箭头都看不见，但按钮能点。
+    # 起因：QSS 给 ::up-button/::down-button 设了背景色，却没定义
+    # ::up-arrow/::down-arrow 的 image —— 只要动了按钮样式，Qt 就不再绘制原生箭头。
+    # （后来又发现 Qt 的 QSS 压根画不出三角，改成按主题现画 ↑ / ↓ 图片，见 ui/spin_arrows.py）
+    # 所以这条用例两头都盯：箭头画出来了 *且* 按钮还在（别为了显箭头把按钮改没了）。
+    from PySide6.QtCore import QPoint
+    from PySide6.QtCore import Qt as _QtBox
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QDoubleSpinBox, QSpinBox
+
+    for box_cls, box_label in ((QSpinBox, "整数框"), (QDoubleSpinBox, "小数框")):
+        box = box_cls()
+        box.setRange(200, 60_000)
+        box.setSuffix(" ms")
+        box.setValue(3000)
+        box.resize(165, 30)
+        box.show()
+        app.processEvents()
+
+        low_up, high_up = spin_button_span(box, top=True)
+        low_down, high_down = spin_button_span(box, top=False)
+        check(f"{box_label}上箭头可见", high_up - low_up > 60,
+              f"亮度 {low_up:.0f}~{high_up:.0f}")
+        check(f"{box_label}下箭头可见", high_down - low_down > 60,
+              f"亮度 {low_down:.0f}~{high_down:.0f}")
+
+        before = box.value()
+        QTest.mouseClick(box, _QtBox.MouseButton.LeftButton,
+                         pos=QPoint(box.width() - 8, 8))
+        app.processEvents()
+        check(f"{box_label}右上角仍可点（值 +1）", box.value() == before + 1,
+              f"{before} -> {box.value()}")
+        box.hide()
+        box.deleteLater()
 
     print("\n[3] 主窗口与 OBS 式面板")
     controller = Controller()
@@ -280,6 +339,22 @@ def main() -> int:
     check("浅色主题下弹出层文字可见", peak < 150 or mean > 150, f"最亮 {peak:.0f}")
     combo2.hidePopup()
     combo2.deleteLater()
+
+    # [2b] 的延伸：箭头图片是按主题现画的，换主题就必须换成新图。
+    # 若图片路径不随主题变，Qt 的 QPixmapCache 会把深色主题的亮箭头继续贴到浅色主题上 ——
+    # 那正是"改了主题却没反应"的经典成因，所以这里要盯住浅色下箭头确实是深的。
+    light_box = QSpinBox()
+    light_box.setRange(0, 60_000)
+    light_box.setValue(3000)
+    light_box.resize(165, 30)
+    light_box.show()
+    app.processEvents()
+    low, high = spin_button_span(light_box, top=True)
+    check("浅色主题下箭头变深（说明换了新图，没被缓存串色）",
+          high - low > 60 and low < 130, f"亮度 {low:.0f}~{high:.0f}")
+    light_box.hide()
+    light_box.deleteLater()
+
     apply_theme(app, "dark")
     check("切回深色", app.palette().color(QPalette.ColorRole.Base).lightness() < 80)
 

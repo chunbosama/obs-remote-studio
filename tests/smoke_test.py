@@ -1026,7 +1026,10 @@ def main() -> int:
     before_set = active.requests.count("SetCurrentSceneTransition")
     before_trigger = active.requests.count("TriggerStudioModeTransition")
     controller.run_quick_transition(0)
-    wait_until(lambda: active.state.current_transition == "Swipe", 5, app)
+    # 转场名与时长是两个独立请求，只等名称会让"时长"断言偶发失败（实测约 1/3 概率），
+    # 所以等两个效果都落地再断言。
+    wait_until(lambda: active.state.current_transition == "Swipe"
+               and active.state.transition_duration == 500, 5, app)
     check("先把当前转场改成槽位里的", active.state.current_transition == "Swipe",
           active.state.current_transition)
     check("转场时长也跟着改", active.state.transition_duration == 500,

@@ -42,7 +42,10 @@ def _load_stylesheet(app: QApplication) -> None:
         template = stylesheet_path().read_text(encoding="utf-8")
     except OSError:
         return
-    app.setStyleSheet(theme.render_stylesheet(template))
+    # 数字框的 ↑ / ↓ 图标是按当前主题现画的（QSS 画不出三角形，见 spin_arrows 说明）
+    from .ui import spin_arrows
+
+    app.setStyleSheet(theme.render_stylesheet(template, spin_arrows.arrow_image_tokens()))
 
 
 def apply_theme(app: QApplication, name: str | None = None) -> str:
