@@ -13,7 +13,7 @@
 | 局域网        | 放行对端 TCP 4455 入站                                      |
 | Python     | ≥ 3.10                                                |
 
-## 一键启动（Windows）
+## 一键启动（源码）
 
 双击项目根目录的 **`start.bat`** 即可。它会自动准备 `.venv`、按需安装依赖、检查 OBS 是否在运行，
 然后拉起界面（无黑色控制台窗口），运行日志写入 `logs\studio-<时间戳>.log`。
@@ -64,32 +64,7 @@ python -m obs_remote_studio
   系统托盘（录制/直播/工作室模式/显隐窗口/退出，可关窗最小化到托盘）、
   全局热键（`Ctrl+Alt+R/L/M`、`Ctrl+Alt+1~9`，默认关闭）、应用内快捷键（F5 / `Ctrl+R` / `Ctrl+L` …）
 
-## 界面（对齐 OBS Studio）
 
-```
-菜单栏  文件(F) 视图(V) 停靠窗口(D) 工具(T) 帮助(H)
-┌──────────────────────────────────────────────────────┐
-│ 预览：场景 │ 转场动画/快捷转场 │ 输出：场景 2          │
-│            │ 转场方式 + 时长   │                      │
-│            │ T 型推杆          │                      │
-│ − 94% + [缩放至窗口 ▾]                                │
-├──────────────────────────────────────────────────────┤
-│ 场景 │ 来源 │ 混音器 │ 转场动画 │ 控制按钮             │
-├─ ● 已连接 127.0.0.1:4455 │ ▂▄▆█ │ 录制 │ 直播 │ CPU │ FPS ┤
-```
-
-- 双画面只在**演播室模式**下出现（与 OBS 相同），非演播室模式只显示「输出」
-- 场景列表蓝色选中行＝当前操作场景：演播室模式下是预览场景，来源列表也跟随它
-- 缩放条是从 OBS 抄的真功能：`缩放至窗口` 按控件大小自适应，`−/+` 在 10%~200% 之间步进
-- **界面里置灰的按钮对应 OBS 的编辑类能力（新建/删除场景与来源、来源属性与滤镜、
-  锁定、快捷转场、T 型推杆、虚拟摄像机、转场列表增删），本阶段没有接入后端**，
-  一律置灰并带悬停说明，避免"点了没反应"。要接通的话每条都在一两个请求以内。
-
-## 仍未做
-
-实时视频流预览（obs-websocket 不提供视频帧流，缩略图已是协议能力上限）、  
-场景/来源的增删改与属性编辑、虚拟摄像机、T 型推杆、快捷转场、输出与编码器设置、
-obs-websocket v4 兼容。理由见 `docs/mvp-feature-list.md`。
 
 ## 目录结构
 
@@ -128,40 +103,6 @@ scripts/render_ui_preview.py  把窗口离屏渲染成 PNG，改版前后对照�
 分层约定：`core` 不 import Qt Widgets，`ui` 只订阅 `state_store` 的信号；  
 所有阻塞网络调用都在 `ObsWorker` 所在线程，UI 线程零网络 IO。
 
-## 六个容易踩的坑（已在代码里规避）
-
-1. **请求连接必须 `subs=0`**。obsws-python 的 `req()` 是"发一个、收一个"，  
-   请求连接一旦订阅事件，事件帧会被当成响应解析（`KeyError: requestStatus`）。  
-   事件一律走独立的 `EventClient`（`subs = Scenes | Outputs | SceneItems`）。
-2. **可见性不在 `GetSceneItemList` 返回里**，需要逐项 `GetSceneItemEnabled`。  
-   这里按请求-响应顺序用队列做关联，并用 generation 丢弃场景切换前的过期响应。
-3. **弹出层（下拉列表/菜单/Tooltip）必须显式指定配色**。它们是独立顶层窗口，
-   不在主窗口的样式继承链里，会跟着 Windows 的浅色/深色模式走，
-   曾经出现过「黑底黑字看不见」。
-   代码里做了两层兜底：`app.setPalette()` 固定 OBS 深色调色板 + QSS 覆盖
-   `QComboBox QAbstractItemView` / `QMenu` / `QToolTip`。
-4. **别用 `QLabel.setPixmap()` 显示会随控件缩放的图**。QLabel 会把图片尺寸算进
-   sizeHint，而缩略图是按控件大小缩放出来的，于是形成正反馈：
-   控件变大 → 图变大 → sizeHint 变大 → 布局要求更大 → 控件再变大。
-   现象是连上 OBS 后**边框每秒往外挪一点、窗口越长越大**（实测窗口最小高度
-   3 秒内从 332 涨到 682，且不会自己停）。预览区因此改成自定义控件在
-   `paintEvent` 里画，尺寸用 `QSizePolicy.Ignored` 完全退出布局计算。
-   `tests/ui_layout_stability_test.py` 专门守这条。
-5. **`QSettings(组织, 应用)` 在 Windows 上写的是注册表**，`QSettings.setPath(IniFormat, ...)`
-   对它无效（格式不对）。测试如果不换 org 名，就会直接改用户的真实配置——
-   本项目真的踩过：测试把 `connection/password` 写成了 `testpass`、把用户的面板布局也改了。
-   现在测试统一设 `OBSRS_SETTINGS_ORG` + `OBSRS_SETTINGS_INI`（见 `core/settings.py`），
-   `tests/ui_style_test.py` 里有一条断言专门守这个。
-6. **离屏渲染（`QT_QPA_PLATFORM=offscreen`）下系统字体库是空的**，中文会全变方块，
-   而且 `QFontDatabase.addApplicationFont()` 必须在 `QApplication` 之后调用，
-   否则直接段错误——`scripts/render_ui_preview.py` 里已按这个顺序处理。
-4. **请求名以服务端上报的 `availableRequests` 为准，别照书抄**。
-   各版本请求名并不一致：转场列表在 obs-websocket 5.0 叫 `GetTransitionList`，
-   5.1 起改名 `GetSceneTransitionList`（老名字在 5.3+ / OBS 30+ 已移除），
-   发错了会收到 **204 `Your request type is not valid`**。握手时那次 `GetVersion`
-   会带回 `availableRequests`，代码在 `_on_connected` 里落到 `StateStore.supported_requests`，
-   由 `Controller.send_if_supported()` 决定发不发；万一服务端谎报，收到 204 后
-   会记入 `rejected_requests` 不再重发，也不弹框打扰用户。
 
 ## 测试
 
@@ -194,3 +135,4 @@ python tests/fake_obs_server.py     # 打印端口，密码 testpass
   `_read_password` / `_write_password`。
 - 缩略图每帧都要 OBS 端完整编码一次。默认 480px 宽 / 质量 60 已经很轻，
   但演播室模式下是双画面，合计 2 帧/秒；若 OBS 端 CPU 吃紧，就把间隔调大。
+- T型推杆仅在OBS 29.0.2版本及以下可以正常使用。
