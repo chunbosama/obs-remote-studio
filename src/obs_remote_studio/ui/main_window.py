@@ -19,10 +19,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
     QMainWindow,
-    QMenu,
     QMessageBox,
     QSystemTrayIcon,
-    QVBoxLayout,
     QWidget,
 )
 
@@ -35,6 +33,7 @@ from .dialogs.connect_dialog import ConnectDialog
 from .dialogs.diagnostics_dialog import DiagnosticsWindow
 from .dialogs.quick_transitions_dialog import QuickTransitionsDialog
 from .dialogs.settings_dialog import SettingsDialog
+from .dialogs.stream_caption_dialog import StreamCaptionDialog
 from .widgets.controls_panel import ControlsPanel
 from .widgets.dock_panel import DockGrip
 from .widgets.mixer import MixerPanel
@@ -69,6 +68,7 @@ class MainWindow(QMainWindow):
 
         self._advanced_dialog: AdvancedAudioDialog | None = None
         self._diagnostics_dialog: DiagnosticsWindow | None = None
+        self._caption_dialog = None  # P7：推流字幕（延迟创建，避免未用就建窗）
         self._tray: TrayIcon | None = None
         self._hotkeys = GlobalHotkeys(self)
         # H10：迷你模式标志必须在 _build_layout 之前就位（_save_layout 会读它）
@@ -250,6 +250,7 @@ class MainWindow(QMainWindow):
 
         tools_menu = self.menuBar().addMenu("工具(&T)")
         tools_menu.addAction("高级音频属性…", lambda: self.open_advanced_audio(None))
+        tools_menu.addAction("推流字幕…", self.open_stream_caption)  # P7
         tools_menu.addAction("诊断窗口（原始 JSON）…", self.open_diagnostics)
         tools_menu.addSeparator()
         tools_menu.addAction("设置…", self._open_settings_dialog)
@@ -450,6 +451,29 @@ class MainWindow(QMainWindow):
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+
+    def open_stream_caption(self) -> None:
+        """P7：推流字幕窗。非模态，方便一边看画面一边发字幕。
+
+        「清除」单独走一条空字幕（协议允许空串，语义就是清屏），
+        所以这里给两个回调而不是让窗口自己拼请求。
+        """
+        if self._caption_dialog is None:
+            self._caption_dialog = StreamCaptionDialog(
+                self.store,
+                {
+                    "send": self.controller.send_stream_caption,
+                    "blocker": self.controller.stream_caption_blocker,
+                    "clear": lambda: self.controller.send_stream_caption(""),
+                },
+                self,
+            )
+        dialog = self._caption_dialog
+        dialog.refresh()  # 打开时按当前推流状态刷新，别显示陈旧状态
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        dialog.text_edit.setFocus()
 
     def _set_mixer_unit(self, show_percent: bool) -> None:
         self.controller.config.mixer_show_percent = show_percent

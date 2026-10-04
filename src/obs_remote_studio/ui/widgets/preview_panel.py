@@ -204,6 +204,8 @@ class _TransitionColumn(QWidget):
         self._tbar_applying = False
         self._tbar_pending: float | None = None
         self._quick_buttons: list[QPushButton] = []
+        # 快捷转场行末尾弹簧项的下标（只建一次，见 refresh_quick_slots）
+        self._quick_stretch_index: int | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 0, 4, 0)
@@ -267,12 +269,16 @@ class _TransitionColumn(QWidget):
         self.tbar.valueChanged.connect(self._on_tbar_moved)
         self.tbar.sliderReleased.connect(self._on_tbar_released)
 
-        tbar_row = QHBoxLayout()
+        # 整行套一个容器：OBS 版本不支持时要能把它**整行藏掉**
+        # （布局本身没有 setVisible，必须包一层 QWidget）
+        self.tbar_row = QWidget()
+        tbar_row = QHBoxLayout(self.tbar_row)
+        tbar_row.setContentsMargins(0, 0, 0, 0)
         tbar_row.setSpacing(4)
         tbar_row.addWidget(QLabel("预览"))
         tbar_row.addWidget(self.tbar, 1)
         tbar_row.addWidget(QLabel("输出"))
-        layout.addLayout(tbar_row)
+        layout.addWidget(self.tbar_row)
 
         # 推杆不可用时把原因直接写在界面上（工具栏只有 190px 宽，允许折行）
         self.tbar_hint = QLabel("")
@@ -301,6 +307,8 @@ class _TransitionColumn(QWidget):
         store.capabilities_changed.connect(self._update_button)
         store.studio_changed.connect(self._update_button)
         store.tbar_ignored_changed.connect(self._update_button)
+        # 连上以后才知道 OBS 版本，而推杆显不显示要看版本
+        store.server_info_changed.connect(lambda _info: self._update_button())
         store.transitioning_changed.connect(self._update_button)
         store.connection_state_changed.connect(self._on_connection_state)
         store.tbar_changed.connect(self._update_tbar)
@@ -349,6 +357,21 @@ class _TransitionColumn(QWidget):
         # → OBS 侧转场一直开着、SceneTransitionEnded 不来 → 按钮卡在「转场中」。
         # 所以推杆只看"能不能用"，不看"是不是正在转场"（OBS 里推杆也是随时可拖的）。
         tbar_ok = self._tbar_usable()
+        # 版本门槛放在最前面：OBS ≥29.1 的 API 根本完不成手动推杆
+        # （obs-studio issue #11372，修复 PR #13143 未合入），这时候**整行藏掉**，
+        # 不摆一个必然无效的控件在那儿。
+        version_ok = P.tbar_version_ok(self.store.server_info.obs_version)
+        self.tbar_row.setVisible(version_ok)
+        if not version_ok:
+            self.tbar.setEnabled(False)
+            self.tbar_hint.setText(
+                f"OBS {self.store.server_info.obs_version} 的推杆 API 有缺陷"
+                "（obs-studio #11372），已隐藏该控件"
+            )
+            self.tbar_hint.setVisible(True)
+            for button in self._quick_buttons:
+                button.setEnabled(self.store.studio_mode)
+            return
         self.tbar.setEnabled(tbar_ok)
         self.tbar.setToolTip(TBAR_TOOLTIP if tbar_ok else f"T 型推杆不可用：{self._tbar_block_reason()}")
         # 把"为什么用不了 / 有什么要注意"**写在界面上**，别只藏在 tooltip 里 ——
@@ -473,7 +496,13 @@ class _TransitionColumn(QWidget):
                 )
             else:
                 button.setVisible(False)
-        self.quick_row.addStretch(1)
+        # 末尾的弹簧项**只建一次**。以前放在这里每次都 addStretch，
+        # 而本方法在 transitions_changed / 保存槽位 / 换主题时都会被调到 ——
+        # 弹簧项只增不减，实测刷新 20 次后布局项从 2 涨到 22（每次 +1），
+        # 既无上限增长，又会把槽位按钮往左挤。
+        if self._quick_stretch_index is None:
+            self.quick_row.addStretch(1)
+            self._quick_stretch_index = self.quick_row.count() - 1
         self.quick_manage_btn.setEnabled(True)
 
     def _manage_quick_slots(self) -> None:

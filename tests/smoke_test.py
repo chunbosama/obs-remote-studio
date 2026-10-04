@@ -39,6 +39,25 @@ CHECKS: list[str] = []
 FAILED: list[str] = []
 
 
+SLOT_ERRORS: list[str] = []
+
+
+def _slot_exception_hook(kind, value, traceback_) -> None:
+    """接住 Qt 槽函数里抛出的异常。
+
+    Qt 不会让槽里的异常中断程序，只把 traceback 打出来就继续跑 ——
+    于是"功能坏了但测试全绿"会溜过去。这里全部记下来，最后统一判失败。
+    """
+    import traceback as _traceback
+
+    text = "".join(_traceback.format_exception(kind, value, traceback_)).strip()
+    SLOT_ERRORS.append(text)
+    print(text, file=sys.stderr)
+
+
+sys.excepthook = _slot_exception_hook
+
+
 def check(name: str, condition: bool, extra: str = "") -> None:
     if condition:
         CHECKS.append(name)
@@ -69,6 +88,30 @@ def main() -> int:
     tmp_dir = tempfile.mkdtemp(prefix="obsrs-smoke-")
     QSettings.setDefaultFormat(QSettings.IniFormat)
     QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, tmp_dir)
+
+    print("[0] 假服务器起不来时必须报错，不许假装成功（回归）")
+    # 病因：start() 只做 `self._ready.wait(10); return self.port`。
+    # bind 失败发生在服务器线程里，_ready 永不被 set，于是 10 秒后
+    # 若无其事地返回一个**根本没人在听的端口** —— 测试随后在连接超时上失败，
+    # 报错指向完全不相干的地方。测试基础设施静默失败比产品代码失败更贵。
+    blocker = socket.socket()
+    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    busy_port = blocker.getsockname()[1]
+    doomed_server = FakeObsServer(host="127.0.0.1", port=busy_port)
+    raised: BaseException | None = None
+    try:
+        returned = doomed_server.start()
+    except BaseException as exc:  # noqa: BLE001 - 这里就是要证明它会抛
+        raised = exc
+        returned = None
+    check("端口被占用时 start() 抛异常（不再返回假端口）",
+          raised is not None, f"returned={returned!r}")
+    check("异常信息点明了端口/原因",
+          raised is not None and ("端口" in str(raised) or "启动失败" in str(raised)),
+          str(raised))
+    blocker.close()
 
     port = free_port()
     server = FakeObsServer(host="127.0.0.1", port=port)
@@ -145,6 +188,69 @@ def main() -> int:
     controller.toggle_stream()
     wait_until(lambda: not controller.store.stream.active, 5, app)
     check("停止推流", not controller.store.stream.active)
+
+    print("\n[4a] P7：推流字幕（CEA-608）")
+    # 关键事实（照 RequestHandler_Stream.cpp）：SendStreamCaption 第一件事就是查
+    # obs_frontend_streaming_active()，没推流直接回 501 OutputNotRunning；
+    # captionText 必填但**允许空串**，空串＝清除当前字幕。
+    check("字幕能力探测为真", controller.caption_supported())
+    check("未推流时不给出可发送的假象",
+          controller.stream_caption_blocker() != "", controller.stream_caption_blocker())
+    captions_before = len(active.state.captions)
+    check("未推流时本地就拦住，不发请求",
+          controller.send_stream_caption("不该发出去") is False)
+    for _ in range(20):
+        app.processEvents()
+        time.sleep(0.02)
+    check("服务端没收到任何字幕", len(active.state.captions) == captions_before,
+          str(active.state.captions))
+
+    # 真开推流后再发：必须真的到达服务端
+    controller.toggle_stream()
+    wait_until(lambda: controller.store.stream.active, 5, app)
+    check("推流中不再有拦截原因",
+          controller.stream_caption_blocker() == "", controller.stream_caption_blocker())
+    check("推流中下发字幕成功", controller.send_stream_caption("开场提示"))
+    wait_until(lambda: "开场提示" in active.state.captions, 5, app)
+    check("服务端真的收到了字幕", "开场提示" in active.state.captions,
+          str(active.state.captions))
+
+    # 空串＝清除字幕，是协议明确允许的用法，不能被"空输入"校验挡掉
+    check("空串下发成功（清除字幕）", controller.send_stream_caption(""))
+    wait_until(lambda: active.state.captions and active.state.captions[-1] == "", 5, app)
+    check("服务端收到空串（＝清屏）",
+          bool(active.state.captions) and active.state.captions[-1] == "",
+          str(active.state.captions))
+
+    # 服务端在没推流时回 501：此时要把原因讲清楚并回读推流状态纠正本地。
+    # 制造"两边不一致"：**客户端以为在推流**（blocker 放行），
+    # 而 OBS 端其实没推 → 服务端回 501。真实成因是推流刚停/刚启，
+    # 客户端的状态还没跟上（事件与轮询都可能慢一拍）。
+    controller.toggle_stream()
+    wait_until(lambda: not controller.store.stream.active, 5, app)
+    # 只改客户端状态：blocker 读的是 store.stream.active
+    from obs_remote_studio.core.models import StreamStatus
+
+    controller.store.set_stream(
+        StreamStatus(active=True, total_frames=1800, duration_ms=30_000)
+    )
+    # 变量名带前缀：本项目踩过"同名变量把后面段落的闭包改了指"的坑
+    # （见 docs 变更记录 2026-10-03），不能与 [16d] 段的 alerts 撞车。
+    caption_alerts: list[str] = []
+    controller.store.error_raised.connect(
+        lambda _title, detail: caption_alerts.append(detail)
+    )
+    check("客户端以为在推流时 blocker 放行（不一致前提成立）",
+          controller.stream_caption_blocker() == "", controller.stream_caption_blocker())
+    # 而 OBS 端没推流 → 服务端回 501。直接走失败分支复现。
+    controller._on_request_failed("SendStreamCaption", "Output is not running", False, 501)
+    check("501 被识别成「没在推流」并给出中文原因",
+          any("没有在推流" in a for a in caption_alerts), str(caption_alerts[:2]))
+    # 失败后要回读推流状态纠正本地，否则字幕框会一直假装能用
+    wait_until(lambda: not controller.store.stream.active, 5, app)
+    check("501 后回读推流状态，本地被纠正为未推流",
+          not controller.store.stream.active, str(controller.store.stream.active))
+
 
     print("\n[4b] D6：录制暂停 / 继续")
     controller.toggle_record()
@@ -343,6 +449,59 @@ def main() -> int:
         5, app,
     )
 
+    # 回归：**纯混音器音频源**（当前场景里没有来源引用它）改名后，
+    # 混音器也必须刷新。病因：旧实现是
+    # `if not self.store.rename_scene_item_source(old, new): return`，
+    # 而该函数只在"当前展示场景里有来源引用它"时才返回 True，
+    # 于是麦克风/桌面音频这类源改名后混音器永不刷新，推子挂在一个
+    # 已不存在的名字上（名字与状态失联）。
+    # 用直接调处理器的方式确定性复现：构造"场景里没有该项"的场景。
+    refreshed: list[str] = []
+    real_refresh_audio = controller.refresh_audio
+    saved_items_for_rename = list(controller.store.scene_items)
+    try:
+        # 场景里的来源与要改名的 input 完全无关
+        controller.store.set_scene_items([])
+
+        class _RenameEvent:
+            pass
+
+        rename_evt = _RenameEvent()
+        rename_evt.old_input_name = "桌面音频"
+        rename_evt.input_name = "桌面音频 2"
+        controller.refresh_audio = lambda: refreshed.append("audio")
+        controller._event_input_name_changed(rename_evt)
+        check("纯混音器源改名也会刷新混音器（不再被场景引用与否挡住）",
+              refreshed == ["audio"], f"refreshed={refreshed}")
+    finally:
+        controller.refresh_audio = real_refresh_audio
+        controller.store.set_scene_items(saved_items_for_rename)
+
+    # 反面：同名 / 空新名的事件不该白刷一次
+    refreshed.clear()
+    try:
+        class _SameNameEvent:
+            pass
+
+        same_evt = _SameNameEvent()
+        same_evt.old_input_name = "麦克风"
+        same_evt.input_name = "麦克风"
+        controller.refresh_audio = lambda: refreshed.append("audio")
+        controller._event_input_name_changed(same_evt)
+        check("同名改名事件不触发无谓刷新", refreshed == [], f"refreshed={refreshed}")
+
+        refreshed.clear()
+        class _EmptyNameEvent:
+            pass
+
+        empty_evt = _EmptyNameEvent()
+        empty_evt.old_input_name = "麦克风"
+        empty_evt.input_name = ""
+        controller._event_input_name_changed(empty_evt)
+        check("空新名的改名事件被忽略", refreshed == [], f"refreshed={refreshed}")
+    finally:
+        controller.refresh_audio = real_refresh_audio
+
     # 其他场景的事件不该动当前列表
     before_other = [i.source_name for i in controller.store.scene_items]
     server.broadcast_threadsafe(
@@ -359,6 +518,61 @@ def main() -> int:
     check("非当前场景的事件不影响当前列表",
           [i.source_name for i in controller.store.scene_items] == before_other,
           str([i.source_name for i in controller.store.scene_items]))
+
+    print("\n[5b-2] 可见性查询失败不许卡死队列、也不许错位（回归）")
+    # 病因：成功分支才 popleft，失败分支只覆盖 _AUDIO_GET_REQUESTS，
+    # 而 REQ_GET_SCENE_ITEM_ENABLED 不在其中。可见性只能按**请求顺序**关联
+    # （响应不带 sceneItemId），于是队首不推进会同时造成两个坏结果：
+    # ①队列永远清不空 → scene_items 再也提交不了（来源列表永久空白）；
+    # ②后续响应按位置落到前一个来源头上 → A 的可见性写到 B 身上。
+    # 直接喂请求响应，确定性复现，不依赖网络时序。
+    from collections import deque
+    from obs_remote_studio.core.models import SceneItem
+
+    saved_items = list(controller.store.scene_items)
+    controller.store.set_scene_items([SceneItem(item_id=41, source_name="一号")])
+    controller.store.set_scene_items([SceneItem(item_id=42, source_name="二号")])
+    controller._items_generation += 1
+    controller._items_scene = controller.source_scene
+    controller._items_buffer = {
+        41: SceneItem(item_id=41, source_name="一号"),
+        42: SceneItem(item_id=42, source_name="二号"),
+        43: SceneItem(item_id=43, source_name="三号"),
+    }
+    controller._pending_enabled = deque(
+        (controller._items_generation, controller._items_scene, i) for i in (41, 42, 43)
+    )
+
+    class _Enabled:
+        def __init__(self, value):
+            self.scene_item_enabled = value
+
+    # 41 的查询失败（例如来源被并发删除 / 超时 / 604）
+    controller._on_request_failed(
+        "GetSceneItemEnabled", "Scene item does not exist", False, 604
+    )
+    check("失败会推进队列（不再永久卡住）",
+          len(controller._pending_enabled) == 2,
+          str(len(controller._pending_enabled)))
+    # 42 / 43 正常返回：必须各自落到**自己**头上，不能错位
+    controller._handle_get_scene_item_enabled(_Enabled(True))    # 这是 42 的
+    controller._handle_get_scene_item_enabled(_Enabled(False))   # 这是 43 的
+    check("全部响应落地后队列清空", not controller._pending_enabled)
+    committed = {i.item_id: i.enabled for i in controller.store.scene_items}
+    check("可见性没有错位（42=True, 43=False）",
+          committed.get(42) is True and committed.get(43) is False,
+          str(committed))
+    check("失败项沿用上一次显示的值（不冒充可见）",
+          41 in committed, f"ids={sorted(committed)}")
+
+    # 复原本段造成的状态：只清队列与缓冲，**不能调 _stop_polling()** ——
+    # 那会把轮询/缩略图/心跳定时器一起停掉，后面几段（掉线重连、缩略图、转场）
+    # 就全哑了（实测一次踩掉 6 项）。
+    controller._pending_enabled.clear()
+    controller._items_buffer = {}
+    controller.store.set_scene_items(saved_items)
+    controller._refresh_scene_items()
+    wait_until(lambda: len(controller.store.scene_items) == len(saved_items), 5, app)
 
     print("\n[5c] B5：场景新建 / 重命名 / 删除")
     check("场景编辑能力探测为真", controller.supports_scene_edit())
@@ -387,6 +601,20 @@ def main() -> int:
     check("重名 / 空名不发出请求",
           active.requests.count("CreateScene") == create_before,
           f"{active.requests.count('CreateScene')} vs {create_before}")
+
+    # 断开清理要顺手把可见性队列与缓冲清干净（否则下一条连接的首批响应错位）
+    from collections import deque as _deque
+    controller._pending_enabled = _deque(
+        [(controller._items_generation, controller.source_scene, 1)]
+    )
+    controller._items_buffer = {1: object()}
+    controller._stop_polling()
+    check("断开清理同时清空可见性队列与缓冲",
+          not controller._pending_enabled and not controller._items_buffer,
+          f"queue={len(controller._pending_enabled)} buf={len(controller._items_buffer)}")
+    controller._poll_timer.start()
+    controller._frame_timer.start()
+    controller._start_heartbeat()
 
     print("\n[5d] B6：场景拖拽排序（含倒序映射）")
     check("排序能力探测为真", controller.supports_scene_reorder())
@@ -482,6 +710,78 @@ def main() -> int:
     check("来源列表跟随预览场景",
           [i.source_name for i in controller.store.scene_items] == ["结束画面"],
           str([i.source_name for i in controller.store.scene_items]))
+
+    # 回归：演播室模式下来源列表跟随**预览**场景，所以预览场景的显隐事件
+    # 必须被采纳。以前这里拿 `current_scene`（节目场景）做过滤，两个场景不同
+    # 就把预览场景的显隐事件全丢掉，列表停在旧值上（眼睛开关显示错误）。
+    preview_now = controller.store.preview_scene
+    program_now = controller.store.current_scene
+    if preview_now and program_now and preview_now != program_now:
+        target = controller.store.scene_items[0]
+        before_enabled = target.enabled
+
+        class _EnableEvent:
+            pass
+
+        evt = _EnableEvent()
+        evt.scene_name = preview_now
+        evt.scene_item_id = target.item_id
+        evt.scene_item_enabled = not before_enabled
+        controller._event_scene_item_enable_state_changed(evt)
+        after_enabled = next(
+            i for i in controller.store.scene_items if i.item_id == target.item_id
+        ).enabled
+        check("预览场景的显隐事件被采纳（不再拿节目场景过滤）",
+              after_enabled != before_enabled,
+              f"preview={preview_now!r} program={program_now!r} "
+              f"{before_enabled} -> {after_enabled}")
+        # 还原，别影响后面的断言
+        evt.scene_item_enabled = before_enabled
+        controller._event_scene_item_enable_state_changed(evt)
+    else:
+        check("预览场景的显隐事件被采纳（不再拿节目场景过滤）", False,
+              f"前置条件不成立：preview={preview_now!r} program={program_now!r}")
+
+    # 非展示场景的事件仍必须被忽略（否则会把别的场景的可见性套上来）
+    other = [n for n in ("主画面", "开场", "结束") if n != controller.source_scene]
+    if other and controller.store.scene_items:
+        guard_item = controller.store.scene_items[0]
+        guard_before = guard_item.enabled
+
+        class _OtherSceneEvent:
+            pass
+
+        other_evt = _OtherSceneEvent()
+        other_evt.scene_name = other[0]
+        other_evt.scene_item_id = guard_item.item_id
+        other_evt.scene_item_enabled = not guard_before
+        controller._event_scene_item_enable_state_changed(other_evt)
+        guard_after = next(
+            i for i in controller.store.scene_items if i.item_id == guard_item.item_id
+        ).enabled
+        check("其它场景的显隐事件不影响当前列表",
+              guard_after == guard_before,
+              f"scene={other[0]!r} {guard_before} -> {guard_after}")
+
+    # 缺 sceneName 的事件既不能瞎套（旧代码会放行），也要有兜底刷新
+    real_debounced = controller._debounced
+    scheduled: list[str] = []
+    controller._debounced = lambda timer, delay_ms=120: scheduled.append("refresh")
+    class _NoSceneEvent:
+        pass
+
+    no_scene = _NoSceneEvent()
+    no_scene.scene_name = ""
+    no_scene.scene_item_id = controller.store.scene_items[0].item_id
+    no_scene.scene_item_enabled = not controller.store.scene_items[0].enabled
+    no_scene_before = controller.store.scene_items[0].enabled
+    controller._event_scene_item_enable_state_changed(no_scene)
+    controller._debounced = real_debounced
+    check("缺 sceneName 的显隐事件不被采纳（不再空值放行）",
+          controller.store.scene_items[0].enabled == no_scene_before,
+          str(controller.store.scene_items[0].enabled))
+    check("缺 sceneName 时退回整体刷新兜底",
+          len(scheduled) > 0, f"scheduled={len(scheduled)}")
 
     controller.trigger_transition()
     wait_until(lambda: active.state.current_scene == "结束", 5, app)
@@ -775,6 +1075,74 @@ def main() -> int:
     wait_until(lambda: controller.store.connection_state != CONNECTED, 5, app)
     server10.stop()
 
+    print("\n[12f-2] 事件通道建失败后必须真的能重建（回归）")
+    # 曾经的缺陷：worker 声明了 retry_event_link 信号、也写了槽
+    # _on_retry_event_link，但**全仓库没有任何一处 connect** ——
+    # controller 那边照样带退避 emit，于是整条重试链路是死的：
+    # 事件通道一旦建不上，这条连接余生再也收不到事件，而界面还弹框
+    # 告诉用户"正在自动重试"，说了一件不会发生的事。
+    from obs_remote_studio.core.obs_worker import ObsWorker
+
+    probe = ObsWorker()
+    check("retry_event_link 已接到 worker 自己的重建槽",
+          probe.receivers("2retry_event_link()") > 0,
+          f"receivers={probe.receivers('2retry_event_link()')}")
+    # 行为验证：emit 一次必须真的走到 _start_event_client（不再是一条空 emit）。
+    # 注意要把控制通道摆上：_on_retry_event_link 开头有
+    # `if self._req is None: return`（控制通道都没了，重建事件通道没有意义），
+    # 不摆就永远走不到重建那一步，断言会假失败。
+    retried: list[str] = []
+    probe._start_event_client = lambda *a, **k: retried.append("called")
+    probe._event_target = ("127.0.0.1", 4455, "x")
+    probe._req = object()  # 只为通过"控制通道还在"的前置判断
+    probe.retry_event_link.emit()
+    app.processEvents()
+    check("emit retry_event_link 真的会重建事件通道",
+          retried == ["called"], str(retried))
+    # 反面：控制通道已经没了的时候不该瞎重试（避免测试退化成"只要 emit 就过"）
+    retried.clear()
+    probe._req = None
+    probe.retry_event_link.emit()
+    app.processEvents()
+    check("控制通道已断开时不重建事件通道", retried == [], str(retried))
+
+    # controller 侧的退避调度也要能真正跑到底
+    controller.disconnect()
+    wait_until(lambda: controller.store.connection_state != CONNECTED, 5, app)
+    port_ev = free_port()
+    server_ev = FakeObsServer(host="127.0.0.1", port=port_ev)
+    server_ev.start()
+    controller.config.connection = ConnectionConfig(
+        host="127.0.0.1", port=port_ev, password=DEFAULT_PASSWORD
+    )
+    controller.connect()
+    wait_until(lambda: controller.store.connection_state == CONNECTED, 15, app)
+    # 模拟事件通道建立失败：controller 必须安排重试
+    controller._event_retry_attempt = 0
+    controller._on_event_link_failed("模拟：事件通道建立失败")
+    check("事件通道失败后安排了退避重试", controller._event_retry_timer.isActive())
+    # 让定时器到点，确认它真的驱动 worker 去重建（而不是空转）。
+    # 注意打在 `_start_event_client` 上，不能打 `_on_retry_event_link`：
+    # 信号连接在 __init__ 里就把**绑定方法本身**接住了，之后再替换属性
+    # 不会改变已建立的连接（踩过一次，断言恒假）。而 `_start_event_client`
+    # 是在槽内部按 `self.` 现查的，可以安全替换。
+    # 必须还原：后续段落还要用真的 event client（否则事件通道全哑）。
+    rebuilds: list[int] = []
+    real_start = controller.worker._start_event_client
+    controller.worker._start_event_client = lambda *a, **k: rebuilds.append(1)
+    try:
+        controller._on_event_retry()
+        for _ in range(25):
+            app.processEvents()
+            time.sleep(0.02)
+    finally:
+        controller.worker._start_event_client = real_start
+    check("退避到点后真的触发了 worker 侧重建",
+          len(rebuilds) > 0, f"rebuilds={len(rebuilds)}")
+    controller.disconnect()
+    wait_until(lambda: controller.store.connection_state != CONNECTED, 5, app)
+    server_ev.stop()
+
     print("\n[12g] 换服务器时不被上一条连接的残响干扰（回归）")
     # 曾经的缺陷：旧服务器被杀后遗留的传输失败会算到新连接头上，把它误判成掉线 →
     # 排一个重连 → 重连计时器在新连接建立后才到点 → 再 connect 一次 →
@@ -905,17 +1273,38 @@ def main() -> int:
     controller.config.record_warn_gb = 0.0
 
     print("\n[16] G4：T 型推杆")
+    # 推杆的显隐/可用性现在跟 OBS 版本绑定（29.1.0 起 API 失效），
+    # 所以这一段要跑在**最后一个还能用的版本 29.0.2** 上。
+    controller.disconnect()
+    wait_until(lambda: controller.store.connection_state != CONNECTED, 5, app)
+    port_tbar = free_port()
+    tbar_srv = FakeObsServer(
+        host="127.0.0.1", port=port_tbar, obs_version="29.0.2"
+    )
+    tbar_srv.start()
+    controller.config.connection = ConnectionConfig(
+        host="127.0.0.1", port=port_tbar, password=DEFAULT_PASSWORD
+    )
+    controller.connect()
+    wait_until(lambda: controller.store.connection_state == CONNECTED, 15, app)
+    wait_until(lambda: controller.store.server_info.obs_version == "29.0.2", 8, app)
+    check("OBS 版本识别为 29.0.2（推杆可用的最后版本）",
+          controller.store.server_info.obs_version == "29.0.2",
+          controller.store.server_info.obs_version)
+    # 工作室模式要在**换到新服务器之后**再开，而且要等服务端确认 ——
+    # 本地是乐观值，推杆那边是拿它跟服务端做前置判断的
     controller.set_studio_mode(True)
+    wait_until(lambda: tbar_srv.state.studio_mode, 5, app)
     wait_until(lambda: controller.store.studio_mode, 5, app)
     check("v5 协议没有 GetTBarPosition（不回读，只靠事件）",
           not controller.store.supports("GetTBarPosition")
           and controller.store.supports("SetTBarPosition"))
     # 手推第一下 → OBS 会立刻发 SceneTransitionStarted，本地进入"转场中"
     controller.set_tbar_position(0.4, False)
-    wait_until(lambda: abs(active.state.tbar_position - 0.4) < 0.01, 5, app)
+    wait_until(lambda: abs(tbar_srv.state.tbar_position - 0.4) < 0.01, 5, app)
     check("拖动中间位已下发（release=false）",
-          abs(active.state.tbar_position - 0.4) < 0.01,
-          str(active.state.tbar_position))
+          abs(tbar_srv.state.tbar_position - 0.4) < 0.01,
+          str(tbar_srv.state.tbar_position))
     check("本地推杆位置同步", abs(controller.store.tbar_position - 0.4) < 0.01,
           str(controller.store.tbar_position))
     check("手推会进入「转场中」（OBS 发 SceneTransitionStarted）",
@@ -923,15 +1312,15 @@ def main() -> int:
           str(controller.store.transitioning))
     check("转场中已arm看门狗兜底", controller._transition_watchdog.isActive())
     preview_name = controller.store.preview_scene
-    before_release = active.requests.count("SetTBarPosition")
+    before_release = tbar_srv.requests.count("SetTBarPosition")
     # 推到底（position=1.0）松手 → 完成转场
     controller.set_tbar_position(1.0, True)
     # 等请求真的到服务器，而不是等场景名变化 ——
     # 预览场景可能本来就等于当前场景，那样会立即"满足"而请求还没发出去
-    wait_until(lambda: active.requests.count("SetTBarPosition") > before_release, 5, app)
+    wait_until(lambda: tbar_srv.requests.count("SetTBarPosition") > before_release, 5, app)
     check("推到底松手完成转场",
-          active.state.current_scene == preview_name,
-          f"{active.state.current_scene} vs {preview_name}")
+          tbar_srv.state.current_scene == preview_name,
+          f"{tbar_srv.state.current_scene} vs {preview_name}")
     check("松手后退出「转场中」（SceneTransitionEnded 回来了）",
           wait_until(lambda: not controller.store.transitioning, 5, app),
           str(controller.store.transitioning))
@@ -945,20 +1334,20 @@ def main() -> int:
     preview_name = controller.store.preview_scene
     controller.set_tbar_position(0.95, True)
     check("推到 0.95 松手也算完成（OBS 有 10% 容差）",
-          wait_until(lambda: active.state.current_scene == preview_name, 5, app),
-          active.state.current_scene)
+          wait_until(lambda: tbar_srv.state.current_scene == preview_name, 5, app),
+          tbar_srv.state.current_scene)
     # 真正的中途松手：OBS 的两个分支都不进 → 转场保持挂起、不切场景。
     # 客户端不猜 OBS 的意图（界面层会显式发 0.0 回退，见 ui_style_test [9d]），
     # 这里只确认"不会误切场景"，以及"万一没事件回来，看门狗能收干净"。
     controller.set_tbar_position(0.5, False)
     wait_until(lambda: controller.store.transitioning, 5, app)
-    scene_before = active.state.current_scene
+    scene_before = tbar_srv.state.current_scene
     controller.set_tbar_position(0.5, True)
     for _ in range(15):
         app.processEvents()
         time.sleep(0.02)
-    check("中途松手不切场景", active.state.current_scene == scene_before,
-          active.state.current_scene)
+    check("中途松手不切场景", tbar_srv.state.current_scene == scene_before,
+          tbar_srv.state.current_scene)
     check("中途松手后仍有着落（看门狗兜底在位）",
           controller.store.transitioning and controller._transition_watchdog.isActive(),
           f"transitioning={controller.store.transitioning} "
@@ -968,8 +1357,8 @@ def main() -> int:
     check("显式回退能正常收尾",
           wait_until(lambda: not controller.store.transitioning, 5, app),
           str(controller.store.transitioning))
-    check("回退后场景未变", active.state.current_scene == scene_before,
-          active.state.current_scene)
+    check("回退后场景未变", tbar_srv.state.current_scene == scene_before,
+          tbar_srv.state.current_scene)
     # 「转场中」的兜底：万一 Ended 事件丢了，看门狗要能把状态收回来
     controller.store.set_transitioning(True)
     controller._on_transition_watchdog()
@@ -978,14 +1367,14 @@ def main() -> int:
     # 非演播室模式下不该发推杆请求
     controller.set_studio_mode(False)
     wait_until(lambda: not controller.store.studio_mode, 5, app)
-    before_tbar = active.requests.count("SetTBarPosition")
+    before_tbar = tbar_srv.requests.count("SetTBarPosition")
     controller.set_tbar_position(0.5, False)
     for _ in range(10):
         app.processEvents()
         time.sleep(0.02)
     check("非演播室模式下不发推杆请求",
-          active.requests.count("SetTBarPosition") == before_tbar,
-          str(active.requests.count("SetTBarPosition") - before_tbar))
+          tbar_srv.requests.count("SetTBarPosition") == before_tbar,
+          str(tbar_srv.requests.count("SetTBarPosition") - before_tbar))
 
     print("\n[16b] 演播室模式：迟到的回执不能把用户刚切的开关按回去（回归）")
     # 实测到的现象：连上后立刻开演播室模式，连接时那批刷新发出的
@@ -1030,16 +1419,18 @@ def main() -> int:
     # return Error(StudioModeNotActive)` —— 只要两边对工作室模式的认知不同步，
     # 请求就全被 506 拒掉，而客户端如果只信本地状态，界面上的推杆会一直是"可用但没用"。
     # 这里直接制造这种不同步，验证客户端能纠正自己。
-    active.state.studio_mode = False          # OBS 侧其实没开
+    tbar_srv.state.studio_mode = False          # OBS 侧其实没开
     controller.store.set_studio_mode(True)    # 本地却以为开着
     controller.store.clear_unavailable("SetTBarPosition")
     app.processEvents()
     # 同时抓一份原始帧：验证"失败也记成协议原样的响应帧"（含 requestStatus.code）
-    frames: list[tuple[str, str, object]] = []
+    # 注意别叫 frames —— [7] 段的 frame_ready lambda 闭包用的就是这个名字，
+    # 重名会把那个闭包指向这里，缩略图捕获就悄悄坏掉了
+    tbar_trace: list[tuple[str, str, object]] = []
     controller.worker.raw_trace.connect(
-        lambda direction, kind, payload: frames.append((direction, kind, payload))
+        lambda direction, kind, payload: tbar_trace.append((direction, kind, payload))
     )
-    before_caps = active.requests.count("GetStudioModeEnabled")
+    before_caps = tbar_srv.requests.count("GetStudioModeEnabled")
     controller.set_tbar_position(0.5, False)
     check("本地先乐观推到 0.5", controller.store.tbar_position == 0.5,
           str(controller.store.tbar_position))
@@ -1060,7 +1451,7 @@ def main() -> int:
     # 排障关键：失败必须也进诊断窗口，而且是**协议原样**的 requestStatus 形状。
     # 用户按 requestStatus.code 去找却找不到，就会误判成"OBS 没回响应"。
     failed_frames = [
-        payload for _, kind, payload in frames
+        payload for _, kind, payload in tbar_trace
         if kind == "response" and isinstance(payload, dict)
         and isinstance(payload.get("requestStatus"), dict)
         and payload["requestStatus"].get("result") is False
@@ -1069,14 +1460,14 @@ def main() -> int:
           any(p["requestStatus"].get("code") == 506 for p in failed_frames),
           str(failed_frames[:1]))
     check("回读了工作室模式（准备纠正本地状态）",
-          wait_until(lambda: active.requests.count("GetStudioModeEnabled") > before_caps, 5, app),
-          str(active.requests.count("GetStudioModeEnabled") - before_caps))
+          wait_until(lambda: tbar_srv.requests.count("GetStudioModeEnabled") > before_caps, 5, app),
+          str(tbar_srv.requests.count("GetStudioModeEnabled") - before_caps))
     check("本地工作室模式被纠正为关闭",
           wait_until(lambda: not controller.store.studio_mode, 5, app),
           str(controller.store.studio_mode))
     # 真正打开工作室模式后，推杆应当重新可用
     controller.set_studio_mode(True)
-    wait_until(lambda: active.state.studio_mode, 5, app)
+    wait_until(lambda: tbar_srv.state.studio_mode, 5, app)
     wait_until(lambda: controller.store.studio_mode, 5, app)
     check("工作室模式恢复后推杆重新可用",
           wait_until(lambda: not controller.store.is_unavailable("SetTBarPosition"), 5, app),
@@ -1091,6 +1482,16 @@ def main() -> int:
           controller.store.unavailable_reason("SetTBarPosition"))
     controller.store.clear_unavailable("SetTBarPosition")
 
+    # 这一段换了服务器，后面还要用回原来那台 —— 不换回来会把后面全带崩
+    controller.disconnect()
+    wait_until(lambda: controller.store.connection_state != CONNECTED, 5, app)
+    tbar_srv.stop()
+    controller.config.connection = ConnectionConfig(
+        host="127.0.0.1", port=port_n, password=DEFAULT_PASSWORD
+    )
+    controller.connect()
+    wait_until(lambda: controller.store.connection_state == CONNECTED, 15, app)
+
     print("\n[16d] OBS 收下推杆却毫无反应时，必须自己发现并说清原因（回归）")
     # OBS ≥29.1 的缺陷（obs-studio issue #11372 / PR #13143 未合入）：
     # SetTBarPosition **正常返回 code 100**，但 OBS 端什么都不会发生。
@@ -1098,7 +1499,9 @@ def main() -> int:
     controller.disconnect()
     wait_until(lambda: controller.store.connection_state != CONNECTED, 5, app)
     port_silent = free_port()
-    silent = FakeObsServer(host="127.0.0.1", port=port_silent, tbar_silent=True)
+    silent = FakeObsServer(
+        host="127.0.0.1", port=port_silent, tbar_silent=True, obs_version="29.0.2"
+    )
     silent.start()
     controller.config.connection = ConnectionConfig(
         host="127.0.0.1", port=port_silent, password=DEFAULT_PASSWORD
@@ -1115,9 +1518,20 @@ def main() -> int:
     controller.store.error_raised.connect(
         lambda title, detail: alerts.append((title, detail))
     )
+    # 判据是"节目场景变了没有"，所以基线必须已知 —— 场景列表到达之前
+    # `current_scene` 是空串，那时武装自检会得到一个恒真判据、静默失效。
+    # 这条等待正是回归点：以前没等，于是本段约 1/4 概率随机失败。
+    wait_until(lambda: controller.store.current_scene, 8, app)
     scene_before = silent.state.current_scene
     preview_before = silent.state.preview_scene
     controller.set_tbar_position(1.0, True)      # 推到底松手
+    # 正常路径的健全性检查：推到底松手会武装自检，基线取当前节目场景
+    check("推到底松手会武装自检，基线＝当前节目场景",
+          controller._tbar_effect_timer.isActive()
+          and controller._tbar_check_scene == silent.state.current_scene,
+          f"armed={controller._tbar_effect_timer.isActive()} "
+          f"baseline={controller._tbar_check_scene!r} "
+          f"program={silent.state.current_scene!r}")
     for _ in range(20):
         app.processEvents()
         time.sleep(0.02)
@@ -1144,6 +1558,50 @@ def main() -> int:
     wait_until(lambda: silent.state.current_scene == preview_before, 5, app)
     check("OBS 真动了就不会误报", not controller.store.tbar_ignored,
           str(controller.store.tbar_ignored))
+
+    # 回归（确定性，不依赖时间）：**场景未知时绝不能武装自检**。
+    # 病因：判据是"节目场景变了没有"，基线取自 current_scene；连接后场景列表
+    # 到达之前它是空串，此时"空串 → 任意场景名"恒真 —— 自检到点必然被判成
+    # "OBS 有反应"，于是整条"推杆失效"提示静默消失。以前本段约 1/4 概率
+    # 随机失败，根因就在这里。
+    # 直接调生产方法本身，不发请求、不动服务端状态，撤掉修复必红。
+    saved_scene = controller.store.current_scene
+    controller.store.current_scene = ""
+    controller._tbar_effect_timer.stop()
+    controller._tbar_check_scene = ""
+    controller.store.set_tbar_ignored(False)
+    controller._arm_tbar_effect_check()
+    check("场景未知时不武装自检（否则判据恒真、静默失效）",
+          not controller._tbar_effect_timer.isActive()
+          and controller._tbar_check_scene == "",
+          f"armed={controller._tbar_effect_timer.isActive()} "
+          f"baseline={controller._tbar_check_scene!r}")
+    # 另一道兜底：基线未知时即便回调被触发也不许下结论
+    controller._on_tbar_effect_check()
+    check("基线未知时不下「OBS 没理会」的结论",
+          not controller.store.tbar_ignored, str(controller.store.tbar_ignored))
+    controller.store.current_scene = saved_scene
+
+    # 已知失效的版本上，客户端不该再白发请求（界面也把推杆藏了）。
+    # OBS 版本在握手时就定下来了，这里直接改本地认知来模拟换成了一台新版 OBS。
+    from obs_remote_studio.core.models import ServerInfo
+
+    controller.store.set_server_info(ServerInfo(obs_version="31.1.2"))
+    # 先让上一段在途的请求全部落地再采样，否则会把"迟到的那条"算成新发的
+    for _ in range(15):
+        app.processEvents()
+        time.sleep(0.02)
+    before_sends = silent.requests.count("SetTBarPosition")
+    controller.set_tbar_position(0.5, False)
+    controller.set_tbar_position(1.0, True)
+    for _ in range(15):
+        app.processEvents()
+        time.sleep(0.02)
+    check("已知失效的 OBS 版本上不发推杆请求",
+          silent.requests.count("SetTBarPosition") == before_sends,
+          str(silent.requests.count("SetTBarPosition") - before_sends))
+    controller.store.set_server_info(ServerInfo(obs_version="29.0.2"))
+    app.processEvents()
     # 这一段换了服务器，后面的段落还要用回原来那台 —— 不换回来会把它们全带崩
     controller.disconnect()
     wait_until(lambda: controller.store.connection_state != CONNECTED, 5, app)
@@ -1272,6 +1730,11 @@ def main() -> int:
     print(f"\n通过 {len(CHECKS)} 项，失败 {len(FAILED)} 项")
     for failure in FAILED:
         print(f"  - {failure}")
+    if SLOT_ERRORS:
+        print(f"\n警告：测试期间有 {len(SLOT_ERRORS)} 个槽函数抛异常（Qt 默认会吞掉）：")
+        for item in SLOT_ERRORS[:3]:
+            print("  " + item.splitlines()[-1])
+        return 1
     return 1 if FAILED else 0
 
 

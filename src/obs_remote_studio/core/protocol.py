@@ -209,6 +209,28 @@ REQ_SET_TBAR_POSITION = "SetTBarPosition"
 # 否则会出现"OBS 觉得到了、我觉得没到"的状态错位。UI 与控制器共用这一个定义。
 TBAR_CLAMP = 0.1
 
+# T 型推杆的**版本门槛**。
+# obs-studio issue #11372：`obs_frontend_set_tbar_position()` 在 **29.0.2 及更早可用**，
+# 自 **29.1.0-beta1** 起不再更新推杆控件，导致 `TBarReleased()` 读到的永远是 0，
+# API 无法完成手动转场；到 32.1.2 仍未修（修复 PR #13143 尚未合入）。
+# 所以只在这个版本及更早才提供推杆。
+TBAR_LAST_WORKING_VERSION = (29, 0, 2)
+
+
+def tbar_version_ok(obs_version: str) -> bool:
+    """按 OBS 版本判断 T 型推杆的 API 还能不能用。
+
+    **读不出/拿不到版本时返回 True** —— 不能因为"不知道"就把功能藏掉；
+    那种情况交给运行期的"请求成功但没效果"自检兜底（见 controller._on_tbar_effect_check）。
+    """
+    parsed = parse_version(obs_version)
+    if not parsed:
+        return True
+    length = max(len(parsed), len(TBAR_LAST_WORKING_VERSION))
+    left = parsed + (0,) * (length - len(parsed))
+    right = TBAR_LAST_WORKING_VERSION + (0,) * (length - len(TBAR_LAST_WORKING_VERSION))
+    return left <= right
+
 # L：媒体源控制
 REQ_GET_MEDIA_INPUT_STATUS = "GetMediaInputStatus"
 REQ_TRIGGER_MEDIA_INPUT_ACTION = "TriggerMediaInputAction"
@@ -223,6 +245,18 @@ REQ_SET_CURRENT_PROFILE = "SetCurrentProfile"
 
 # D12/D17：录制目录（D17 用它算本地剩余空间）
 REQ_GET_RECORD_DIRECTORY = "GetRecordDirectory"
+
+# P7：推流字幕（CEA-608）。
+# 服务端实现（RequestHandler_Stream.cpp）三件事要记住：
+#   ① `captionText` 是**必填**字段，但**允许空串** —— 空串就是"清除当前字幕"；
+#   ② 它要求推流**正在进行**，否则回 501 OutputNotRunning；
+#   ③ OBS 以 display_duration=0.0 调 obs_output_output_caption_text2()，
+#      含义是"这条立即生效、下一条可紧接着发"，不需要客户端等待。
+# 另外 OBS 内部按 CAPTION_LINE_BYTES 截断单行（CEA-608 惯例 32 字符），
+# 所以界面上按 32 字符给提示，但**不做硬截断**（不替 OBS 决定怎么切）。
+REQ_SEND_STREAM_CAPTION = "SendStreamCaption"
+# CEA-608 单行惯例长度，仅用于界面提示与计数显示
+CAPTION_LINE_CHARS = 32
 
 # ---------------------------------------------------------------- 输出状态
 OUTPUT_STARTING = "OBS_WEBSOCKET_OUTPUT_STARTING"
@@ -294,6 +328,12 @@ RESOURCE_ERROR_CODES = frozenset({600, 601, 602, 603, 604, 605})
 # 它是**用户可纠正**的状态错误（去 OBS 里开工作室模式即可），所以既不能静默吞掉、
 # 也不该按"操作失败"糊一个弹框了事 —— 得把原因讲清楚。
 ERR_STUDIO_MODE_NOT_ACTIVE = 506
+# 501 OutputNotRunning：请求合法，但那个输出当前没在跑。
+# P7 推流字幕就靠它 —— 没推流时发字幕一定被拒（服务端第一件事就是查
+# obs_frontend_streaming_active()）。这是**用户可理解、可纠正**的状态
+# （去点「开始直播」即可），所以要给出明确中文提示，而不是弹一个
+# "SendStreamCaption：Output is not running" 这种内部口气的框。
+ERR_OUTPUT_NOT_RUNNING = 501
 
 # ---------------------------------------------------------------- 名称转换
 _CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")

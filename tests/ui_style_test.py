@@ -554,6 +554,36 @@ def main() -> int:
           "剪切" in column.tbar_hint.text() and not column.tbar_hint.isHidden(),
           column.tbar_hint.text())
 
+    print("\n[9d1] 快捷转场行刷新不许泄漏布局项（回归）")
+    # 病因：refresh_quick_slots() 每次都在行末 addStretch(1)，而它会被
+    # transitions_changed / 保存槽位 / 换主题多次调到。弹簧项只增不减，
+    # 实测刷新 20 次后布局项从 2 涨到 22（每次 +1）—— 既无上限增长，
+    # 又会把槽位按钮往左挤。
+    slots_2 = [
+        {"transition": "渐变", "duration_ms": 300},
+        {"transition": "Cut", "duration_ms": 100},
+    ]
+    original_quick = window.preview_panel.callbacks["quick_slots"]
+    window.preview_panel.callbacks["quick_slots"] = lambda: slots_2
+    try:
+        window.preview_panel.refresh_quick_slots()
+        app.processEvents()
+        baseline = column.quick_row.count()
+        for _ in range(20):
+            window.preview_panel.refresh_quick_slots()
+        app.processEvents()
+        after = column.quick_row.count()
+        check("刷新 20 次后布局项数量不变（无泄漏）",
+              after == baseline, f"{baseline} -> {after}")
+        # 槽位按钮本身仍然按数量正确创建（别为了不泄漏而少建）
+        check("两个槽位各有一个按钮",
+              sum(1 for b in column._quick_buttons if b.isVisible()) == 2
+              if hasattr(column, "_quick_buttons") else False,
+              str([b.isVisible() for b in getattr(column, "_quick_buttons", [])]))
+    finally:
+        window.preview_panel.callbacks["quick_slots"] = original_quick
+        window.preview_panel.refresh_quick_slots()
+
     print("\n[9d2] 推杆不可用时必须在界面上说清原因（回归）")
     controller.store.set_current_transition("渐变")
     controller.store.set_studio_mode(False)
@@ -589,6 +619,39 @@ def main() -> int:
     controller.store.set_tbar_ignored(False)
     app.processEvents()
     check("恢复正常后提示消失", column.tbar_hint.isHidden(), column.tbar_hint.text())
+
+    print("\n[9d3] T 型推杆的版本门槛（回归）")
+    # obs-studio issue #11372：推杆的 API 在 29.0.2 及更早可用，29.1.0-beta1 起失效
+    # （修复 PR #13143 未合入）。所以这个版本区间要**不显示**推杆，
+    # 而不是摆一个必然无效的控件在那儿。
+    from obs_remote_studio.core.models import ServerInfo
+
+    for version, should_show in (
+        ("29.0.2", True),        # 最后一个可用版本，必须留着
+        ("29.0.1", True),        # 更早的当然可用
+        ("28.1.2", True),
+        ("29.1.0-beta1", False), # 从这一版开始失效
+        ("31.1.2", False),
+        ("32.1.2", False),
+        ("", True),              # 读不出/未知：不能武断藏掉，交给运行期自检兜底
+    ):
+        controller.store.set_server_info(ServerInfo(obs_version=version))
+        controller.store.set_studio_mode(True)
+        app.processEvents()
+        shown = not column.tbar_row.isHidden()
+        check(f"OBS {version or '未知'} → 推杆{'显示' if should_show else '隐藏'}",
+              shown == should_show, f"shown={shown}")
+    # 隐藏时要说明原因，别让用户以为功能丢了
+    controller.store.set_server_info(ServerInfo(obs_version="31.1.2"))
+    app.processEvents()
+    check("隐藏时界面上说明是版本缺陷所致",
+          "有缺陷" in column.tbar_hint.text() and not column.tbar_hint.isHidden(),
+          column.tbar_hint.text())
+    controller.store.set_server_info(ServerInfo(obs_version="29.0.2"))
+    app.processEvents()
+    check("可用的版本上不显示这条说明",
+          "有缺陷" not in column.tbar_hint.text(), column.tbar_hint.text())
+
     controller.store.set_transitioning(False)
     controller.store.set_studio_mode(False)
     app.processEvents()
@@ -700,6 +763,57 @@ def main() -> int:
     diag.clear()
     check("清空后无内容", diag.view.toPlainText() == "" and sum(diag._counts.values()) == 0)
     diag.close()
+
+    print("\n[10d] P7：推流字幕窗（回归）")
+    from obs_remote_studio.ui.dialogs.stream_caption_dialog import StreamCaptionDialog
+
+    sent: list[str] = []
+    cap_state = {"blocker": "未在推流，字幕只对直播输出有效"}
+    cap = StreamCaptionDialog(
+        controller.store,
+        {
+            "send": lambda text: (sent.append(text), True)[1],
+            "blocker": lambda: cap_state["blocker"],
+            "clear": lambda: (sent.append(""), True)[1],
+        },
+    )
+    check("字幕窗可构造", cap.windowTitle() == "推流字幕")
+    # 不可发送时：输入与两个按钮都禁用，**并且把原因写出来**（不能只藏在 tooltip）
+    check("不可发送时输入禁用", not cap.text_edit.isEnabled())
+    check("不可发送时发送按钮禁用", not cap.send_btn.isEnabled())
+    check("不可发送时清除按钮也禁用（服务端同样会回 501）",
+          not cap.clear_btn.isEnabled())
+    check("不可发送时界面上写明原因",
+          "未在推流" in cap.status.text(), cap.status.text())
+
+    # 可发送：输入启用、能发、发完清空输入框
+    cap_state["blocker"] = ""
+    cap.refresh()
+    check("可发送时输入启用", cap.text_edit.isEnabled() and cap.send_btn.isEnabled())
+    check("可发送时状态文字说明可以发", "可以发送" in cap.status.text(), cap.status.text())
+    cap.text_edit.setText("开场提示")
+    check("超长前不显示折行提示", "超出" not in cap.counter.text(), cap.counter.text())
+    cap.text_edit.setText("x" * 40)
+    check("超过单行建议长度时给出提示（但不阻断）",
+          "超出" in cap.counter.text(), cap.counter.text())
+    check("超长仍可发送（切分交给 OBS，客户端不替它决定）", cap.send_btn.isEnabled())
+    cap.text_edit.setText("开场提示")
+    cap._send()
+    check("点发送把文本交给控制器", sent == ["开场提示"], str(sent))
+    check("发送后清空输入框", cap.text_edit.text() == "", repr(cap.text_edit.text()))
+
+    # 空输入不该被当成"清除"——清除有专门的按钮，避免误操作
+    sent.clear()
+    cap.text_edit.setText("   ")
+    cap._send()
+    check("空输入不发送（避免误清屏）", sent == [], str(sent))
+    check("空输入给出引导", "清除字幕" in cap.status.text(), cap.status.text())
+
+    # 「清除字幕」走空串，这是协议允许的用法
+    sent.clear()
+    cap._clear()
+    check("清除按钮发送空串", sent == [""], str(sent))
+    cap.close()
 
     print("\n[10b] 诊断窗口：暂停滚动 / 待响应 / 失败帧（回归）")
     diag2 = DiagnosticsWindow()

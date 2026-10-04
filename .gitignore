@@ -1,10 +1,40 @@
+# --- Python ---
 .venv/
+venv/
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
+.eggs/
+
+# --- 测试与静态检查缓存 ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- 构建产物（J5 打包：产物落 dist/，中间物落 build/）---
 build/
 dist/
+*.manifest
+
+# 注意：scripts/packaging/obs_remote_studio.spec 是**入库**的构建配置，
+# 所以这里不能写 *.spec，否则打包配置会被忽略掉。
+
+# --- 运行时产物 ---
 logs/
-.pytest_cache/
-/.workbuddy
-/docs
+*.log
+*.tmp
+.tmp*/
+
+# --- 编辑器 / 系统 ---
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# --- 本地遗留垃圾 ---
+# 0 字节乱码残留（.bat 编码坑的产物，见 .workbuddy/memory 与文档变更记录）。
+# 文件本体保留在磁盘上，但不入库。
+/鑷

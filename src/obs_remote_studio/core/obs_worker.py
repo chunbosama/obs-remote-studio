@@ -94,6 +94,11 @@ class ObsWorker(QObject):
         self.request_connect.connect(self._on_connect)
         self.request_disconnect.connect(self._on_disconnect)
         self.request_execute.connect(self._on_execute)
+        # 事件通道重建必须接上：controller 在事件通道建失败后会带退避 emit 这个信号
+        # （见 controller._schedule_event_retry）。此前**漏了这一行连接**，
+        # 于是整条重试链路是死的 —— 事件通道一旦建不上就再也收不到事件，
+        # 而界面还会告诉用户"正在自动重试"。
+        self.retry_event_link.connect(self._on_retry_event_link)
 
     # ---------------------------------------------------------------- 连接
     @Slot(dict)

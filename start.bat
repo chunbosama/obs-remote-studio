@@ -1,11 +1,22 @@
 @echo off
 REM ============================================================
-REM  OBS Remote Studio 一键启动器
-REM  双击本文件即可启动；逻辑全部在 scripts\start.ps1
-REM  额外参数会原样透传，例如：
-REM      start.bat -Console        保留控制台窗口，实时看日志（排错用）
-REM      start.bat -Reinstall      重装依赖
-REM      start.bat -SmokeTest      启动前先跑冒烟测试
+REM  OBS Remote Studio - one-click launcher
+REM
+REM  Double-click this file to start the app. All the real logic
+REM  lives in scripts\start.ps1. Extra arguments are passed through:
+REM      start.bat -Console      keep the console, watch logs live
+REM      start.bat -Reinstall    reinstall dependencies
+REM      start.bat -SmokeTest    run the smoke test before starting
+REM
+REM  NOTE: keep this file ASCII-only.
+REM  cmd.exe parses .bat files using the console codepage (936 here), so
+REM  UTF-8 Chinese text is decoded as GBK: each 3-byte character leaves a
+REM  stray byte that pairs up with the next byte (often the newline), which
+REM  splits and merges lines. The result is that otherwise-fine lines get
+REM  chopped up and executed as garbage commands. chcp cannot fix this
+REM  because cmd has already been reading the file with the old codepage.
+REM  All user-facing messages (Chinese) belong in scripts\start.ps1,
+REM  which PowerShell reads as UTF-8.
 REM ============================================================
 setlocal
 chcp 65001 >nul
@@ -14,7 +25,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start.ps1" %*
 
 if errorlevel 1 (
     echo.
-    echo 启动失败，请看上面的错误信息。
+    echo [start] FAILED - see the error message above.
     pause
 )
 endlocal

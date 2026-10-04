@@ -7,11 +7,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 
 from PySide6.QtCore import QSettings
 
 from .models import AppConfig, ConnectionConfig, ReconnectPolicy
+
+logger = logging.getLogger(__name__)
 
 ORG_NAME = "obs-remote-studio"
 APP_NAME = "OBS Remote Studio"
@@ -42,25 +45,27 @@ class AppSettings:
 
     # ------------------------------------------------------------ 连接配置
     def load_config(self) -> AppConfig:
+        # 所有数字项一律走 _get_int / _get_float：配置是用户可编辑的本地数据，
+        # 坏值只该回落默认值，不该让程序起不来（详见 _get_int 的说明）。
         cfg = AppConfig()
         cfg.connection = ConnectionConfig(
             host=self._get("connection/host", "127.0.0.1"),
-            port=int(self._get("connection/port", 4455)),
+            port=self._get_int("connection/port", 4455),
             password=self._read_password(),
         )
         cfg.reconnect = ReconnectPolicy(
             enabled=self._get("reconnect/enabled", True, bool),
-            initial_delay_ms=int(self._get("reconnect/initial_delay_ms", 1000)),
-            max_delay_ms=int(self._get("reconnect/max_delay_ms", 30_000)),
-            max_attempts=int(self._get("reconnect/max_attempts", 0)),
+            initial_delay_ms=self._get_int("reconnect/initial_delay_ms", 1000),
+            max_delay_ms=self._get_int("reconnect/max_delay_ms", 30_000),
+            max_attempts=self._get_int("reconnect/max_attempts", 0),
         )
-        cfg.poll_interval_ms = int(self._get("poll/interval_ms", 1000))
-        cfg.stats_every_n_polls = int(self._get("poll/stats_every_n_polls", 3))
-        cfg.request_timeout_s = float(self._get("poll/request_timeout_s", 3.0))
+        cfg.poll_interval_ms = self._get_int("poll/interval_ms", 1000)
+        cfg.stats_every_n_polls = self._get_int("poll/stats_every_n_polls", 3)
+        cfg.request_timeout_s = self._get_float("poll/request_timeout_s", 3.0)
         cfg.auto_connect_on_startup = self._get("general/auto_connect", False, bool)
-        cfg.preview_interval_ms = int(self._get("preview/interval_ms", 1000))
-        cfg.preview_width = int(self._get("preview/width", 480))
-        cfg.preview_quality = int(self._get("preview/quality", 60))
+        cfg.preview_interval_ms = self._get_int("preview/interval_ms", 1000)
+        cfg.preview_width = self._get_int("preview/width", 480)
+        cfg.preview_quality = self._get_int("preview/quality", 60)
         cfg.tray_enabled = self._get("window/tray", True, bool)
         cfg.close_to_tray = self._get("window/close_to_tray", False, bool)
         cfg.global_hotkeys = self._get("window/global_hotkeys", False, bool)
@@ -71,13 +76,13 @@ class AppSettings:
         cfg.mixer_show_percent = self._get("audio/show_percent", False, bool)
         cfg.mixer_hidden_inputs = self._load_hidden_inputs()
         # A11：连接健康
-        cfg.heartbeat_interval_ms = int(self._get("health/heartbeat_ms", 5000))
-        cfg.rtt_warn_ms = int(self._get("health/rtt_warn_ms", 500))
-        cfg.rtt_slow_streak = int(self._get("health/rtt_slow_streak", 3))
+        cfg.heartbeat_interval_ms = self._get_int("health/heartbeat_ms", 5000)
+        cfg.rtt_warn_ms = self._get_int("health/rtt_warn_ms", 500)
+        cfg.rtt_slow_streak = self._get_int("health/rtt_slow_streak", 3)
         # D17：磁盘与时长预警
-        cfg.disk_warn_gb = float(self._get("record/disk_warn_gb", 2.0))
-        cfg.record_warn_minutes = int(self._get("record/warn_minutes", 0))
-        cfg.record_warn_gb = float(self._get("record/warn_gb", 0.0))
+        cfg.disk_warn_gb = self._get_float("record/disk_warn_gb", 2.0)
+        cfg.record_warn_minutes = self._get_int("record/warn_minutes", 0)
+        cfg.record_warn_gb = self._get_float("record/warn_gb", 0.0)
         # G5 / H9 / H10
         cfg.quick_transitions = self._load_quick_transitions()
         cfg.status_segments = self._load_str_list("ui/status_segments")
@@ -113,10 +118,17 @@ class AppSettings:
         for item in items:
             if not isinstance(item, dict) or not item.get("transition"):
                 continue
+            # duration_ms 也要兜住：JSON 里完全可能是 "300"/null/{}，
+            # 直接 int() 会抛，而这条路径同样在启动时跑（理由见 _get_int）。
+            try:
+                duration = int(item.get("duration_ms", 300) or 300)
+            except (TypeError, ValueError):
+                logger.warning("快捷转场槽位的 duration_ms 非法，回落 300：%r", item)
+                duration = 300
             slots.append(
                 {
                     "transition": str(item["transition"]),
-                    "duration_ms": int(item.get("duration_ms", 300) or 300),
+                    "duration_ms": duration,
                 }
             )
         return slots
@@ -178,10 +190,17 @@ class AppSettings:
         out: list[ConnectionConfig] = []
         for item in items:
             if isinstance(item, dict) and item.get("host"):
+                # port 同样要兜住：这条路径经 save_connection -> _add_recent
+                # 在每次保存配置时都会跑到，坏值一样会把启动/保存带崩。
+                try:
+                    port = int(item.get("port", 4455))
+                except (TypeError, ValueError):
+                    logger.warning("最近连接的 port 非法，回落 4455：%r", item)
+                    port = 4455
                 out.append(
                     ConnectionConfig(
                         host=str(item["host"]),
-                        port=int(item.get("port", 4455)),
+                        port=port,
                         password=str(item.get("password", "")),
                     )
                 )
@@ -242,6 +261,35 @@ class AppSettings:
         if cast is bool:
             return str(value).lower() in ("true", "1", "yes")
         return cast(value) if cast else value
+
+    def _get_int(self, key: str, default: int) -> int:
+        """读整数，坏值回落默认值。
+
+        为什么必须兜住：`load_config()` 在 `app.py` 里**窗口还没建**时就调用，
+        配置里只要有一个非数字值（手工编辑 INI、写入被截断、旧版残留），
+        `int()` 就会抛 ValueError 冒到顶层 —— 程序直接起不来，
+        而且用户看不到任何可操作的提示，只会以为"双击了没反应"。
+        配置是本地的、用户可编辑的数据，解析失败绝不能升级成启动失败。
+        """
+        raw = self._qs.value(key)
+        if raw is None:
+            return default
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            logger.warning("配置项 %s=%r 不是整数，回落默认值 %r", key, raw, default)
+            return default
+
+    def _get_float(self, key: str, default: float) -> float:
+        """读浮点，坏值回落默认值（理由同 `_get_int`）。"""
+        raw = self._qs.value(key)
+        if raw is None:
+            return default
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            logger.warning("配置项 %s=%r 不是数字，回落默认值 %r", key, raw, default)
+            return default
 
     def _read_password(self) -> str:
         return str(self._qs.value("connection/password", "") or "")

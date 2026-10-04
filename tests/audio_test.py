@@ -101,6 +101,62 @@ def main() -> int:
     check("电平表解析（标量）", audio.parse_meter_levels([0.25]) == 0.25)
     check("电平表解析（空）", audio.parse_meter_levels(None) == 0.0)
 
+    print("\n[0b] 配置坏值不许把程序带崩（回归）")
+    # 病因：load_config() 在 app.py 里**窗口还没建**时就被调用，而所有数字项
+    # 都是裸 int()/float()。配置是用户可编辑的本地数据（手工改 INI、写入被截断、
+    # 旧版残留），一个非数字值就会让 ValueError 冒到顶层 —— 程序直接起不来，
+    # 用户还会以为"双击了没反应"。坏值只该回落默认值。
+    from obs_remote_studio.core.settings import AppSettings
+
+    bad = AppSettings()
+    bad._qs.setValue("poll/interval_ms", "abc")
+    bad._qs.setValue("connection/port", "not-a-port")
+    bad._qs.setValue("poll/request_timeout_s", "")
+    bad._qs.setValue("health/heartbeat_ms", "5s")
+    bad._qs.setValue("record/disk_warn_gb", "两G")
+    bad._qs.setValue("transitions/quick", '[{"transition": "Fade", "duration_ms": "很久"}]')
+    bad._qs.setValue(
+        "connection/recent", '[{"host": "127.0.0.1", "port": "abc"}]'
+    )
+    bad._qs.sync()
+    try:
+        cfg = AppSettings().load_config()
+        loaded = True
+        detail = ""
+    except BaseException as exc:  # noqa: BLE001 - 这里就是要证明它不抛
+        cfg = None
+        loaded = False
+        detail = f"{type(exc).__name__}: {exc}"
+    check("坏值配置仍能加载（不再启动即崩）", loaded, detail)
+    if loaded:
+        check("poll_interval_ms 回落默认 1000", cfg.poll_interval_ms == 1000,
+              str(cfg.poll_interval_ms))
+        check("port 回落默认 4455", cfg.connection.port == 4455,
+              str(cfg.connection.port))
+        check("request_timeout_s 回落默认 3.0", cfg.request_timeout_s == 3.0,
+              str(cfg.request_timeout_s))
+        check("heartbeat_interval_ms 回落默认 5000",
+              cfg.heartbeat_interval_ms == 5000, str(cfg.heartbeat_interval_ms))
+        check("disk_warn_gb 回落默认 2.0", cfg.disk_warn_gb == 2.0,
+              str(cfg.disk_warn_gb))
+        check("快捷转场槽位 duration_ms 回落 300",
+              cfg.quick_transitions and cfg.quick_transitions[0]["duration_ms"] == 300,
+              str(cfg.quick_transitions))
+    # 最近连接的坏 port 也不能炸
+    try:
+        recent = AppSettings().recent_connections()
+        check("最近连接的坏 port 回落 4455",
+              recent and recent[0].port == 4455, str(recent))
+    except BaseException as exc:  # noqa: BLE001
+        check("最近连接的坏 port 回落 4455", False, f"{type(exc).__name__}: {exc}")
+    # 好值不能被这条兜底改坏
+    good = AppSettings()
+    good._qs.setValue("poll/interval_ms", 750)
+    good._qs.sync()
+    check("合法值照常读取（兜底没把好值吃掉）",
+          AppSettings().load_config().poll_interval_ms == 750,
+          str(AppSettings().load_config().poll_interval_ms))
+
     port = free_port()
     server = FakeObsServer(host="127.0.0.1", port=port)
     server.start()
@@ -158,6 +214,42 @@ def main() -> int:
     check("桌面音频电平 ≈0.62", abs(meters.get("桌面音频", 0) - 0.62) < 0.01,
           str(meters.get("桌面音频")))
     check("服务端确实在推高频事件", server.state.meter_events > 0, str(server.state.meter_events))
+
+    print("\n[3b] E9 批量静音的失败统计不许漏记（回归）")
+    # 病因：判据是 `self._mute_all_pending`（裸计数），而收尾定时器会把它清零。
+    # 清零之后到达的失败就掉出这个分支 —— 换成通用错误分支，把内部请求名
+    # `SetInputMute` 直接弹给用户；更糟的是失败数就此丢掉，
+    # "报了 3 个源、前 2 个失败、最后一个失败没人知道"。
+    # 现在改用时间窗口判定，收尾后仍留一段宽限期。
+    from obs_remote_studio.core.controller import _request_label
+
+    sent_mutes: list[str] = []
+    real_send = controller.send
+    controller.send = lambda rt, data=None: sent_mutes.append(rt) or real_send(rt, data)
+    try:
+        controller.set_all_muted(True)
+    finally:
+        controller.send = real_send
+    check("批量静音逐源下发", sent_mutes.count("SetInputMute") >= 1, str(sent_mutes[:5]))
+    check("下发后处于累计窗口内", controller._mute_all_in_window())
+
+    controller._on_request_failed("SetInputMute", "boom", False, 0)
+    controller._on_request_failed("SetInputMute", "boom", False, 0)
+    controller._flush_mute_all()          # 收尾定时器到点
+    after_settle = controller._mute_all_failures
+    controller._on_request_failed("SetInputMute", "boom", False, 0)  # 迟到的失败
+    check("收尾后迟到的失败仍被计入（不再被静默丢掉）",
+          controller._mute_all_failures == after_settle + 1,
+          f"{after_settle} -> {controller._mute_all_failures}")
+    controller._flush_mute_all()
+
+    # 用户可读标签：内部请求名不该出现在给用户看的文案里
+    check("内部请求名有用户可读名称",
+          _request_label("SetInputMute") == "切换静音",
+          _request_label("SetInputMute"))
+    check("未登记的请求名回落中性说法（不泄漏内部名）",
+          _request_label("SomeInternalRequest") == "操作",
+          _request_label("SomeInternalRequest"))
 
     print("\n[4] E6 高级音频属性")
     controller.fetch_advanced_audio("媒体源2")

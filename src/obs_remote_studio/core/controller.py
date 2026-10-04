@@ -66,6 +66,15 @@ EVENT_RETRY_MAX_ATTEMPTS = 4
 # G4：推杆"推到底松手"之后，等多久还没任何转场动静就判定 OBS 没理会这次推杆
 TBAR_NO_EFFECT_CHECK_MS = 3000
 
+# E9：批量静音的收尾等待窗口。
+# 用"时间窗口"而不是"计数到零"来界定这一批：`request_failed` 只带
+# requestType、**不带 inputName**，靠计数递减无法区分"批量里的失败"与
+# "用户单独静音失败"，也无法在定时器已把计数清零后再接住迟到的失败。
+MUTE_ALL_SETTLE_MS = 1500
+# 收尾之后再宽限一小段：让"收尾后才到"的失败仍算进这一批，
+# 不至于掉进通用错误分支（那里会把 SetInputMute 这种内部请求名弹给用户）。
+MUTE_ALL_GRACE_MS = 1500
+
 # G4：OBS 收下推杆请求却毫无反应 —— 这是 **OBS 自己的缺陷**，不是本客户端的。
 # 依据（都已核实到上游）：
 #   · obs-studio issue #11372（2024-10 提交，至今 open）：
@@ -144,6 +153,8 @@ class Controller(QObject):
         self._transition_watchdog.timeout.connect(self._on_transition_watchdog)
         # T 型推杆是否正处于"一次拖拽"中（只影响日志详略）
         self._tbar_in_drag = False
+        # "本版本 OBS 用不了推杆"只提醒一次，别每次拖动都刷日志
+        self._tbar_version_warned = False
 
         # G4：推杆"有没有被 OBS 理会"的校验
         self._tbar_effect_timer = QTimer(self)
@@ -190,10 +201,11 @@ class Controller(QObject):
         # E9：批量静音的状态汇总（回执没有 handler，靠这个定时器收尾）
         self._mute_all_timer = QTimer(self)
         self._mute_all_timer.setSingleShot(True)
-        self._mute_all_timer.setInterval(1500)
+        self._mute_all_timer.setInterval(MUTE_ALL_SETTLE_MS)
         self._mute_all_timer.timeout.connect(self._flush_mute_all)
         self._mute_all_pending: int = 0
         self._mute_all_failures: int = 0
+        self._mute_all_started_at: float = 0.0
 
         self._attempt = 0
         self._transport_failures = 0
@@ -291,6 +303,7 @@ class Controller(QObject):
         # 否则 _refresh_transitions 只能靠"发了被拒"来试错。
         self.store.set_capabilities(info.get("available_requests") or [])
         self.store.set_tbar_ignored(False)
+        self._tbar_version_warned = False
         self._transition_fallback_used = False
         # 新连接：录制目录要重新问（可能换了台机器），RTT 样本也从头算
         self._record_directory = ""
@@ -444,6 +457,10 @@ class Controller(QObject):
         self._frame_queue.clear()
         self._frame_pending.clear()
         self._pending_audio.clear()
+        # 可见性查询队列同样要清：断开后残留的登记会让下一条连接的
+        # 首批响应错位（旧世代会被 generation 挡掉，但队列本身得干净）
+        self._pending_enabled.clear()
+        self._items_buffer = {}
         self._poll_ticks = 0
 
     @Slot()
@@ -595,6 +612,12 @@ class Controller(QObject):
 
         刻意**不并发**：worker 是按队列一条条处理的，逐个下发既能保持顺序，
         也避免在弱网下一口气压满 socket。失败只汇总提示一次（见 _flush_mute_all）。
+
+        `request_failed` **只带 requestType、不带 inputName**，所以既分不出
+        "批量里的失败"与"用户单独点的静音失败"，也没法把失败归到具体源上。
+        因此用**时间窗口**来界定这一批：窗口内累计失败，到点汇总一次。
+        （以前是裸计数 + 定时器清零，定时器把 pending 归零后到达的失败会被
+        静默丢掉 —— 报了 3 个源、前 2 个失败、第 3 个失败没人知道。）
         """
         names = [item.name for item in self.store.audio_inputs]
         if not names:
@@ -603,17 +626,30 @@ class Controller(QObject):
             self.store.update_audio_input(name, muted=muted)
         self._mute_all_pending = len(names)
         self._mute_all_failures = 0
+        self._mute_all_started_at = time.monotonic()
         for name in names:
             self.send(P.REQ_SET_INPUT_MUTE, {"inputName": name, "inputMuted": muted})
         # 回执没有专门的 handler，用一个小定时器收尾总结
         self._mute_all_timer.start()
 
+    def _mute_all_in_window(self) -> bool:
+        """当前是否处在批量静音的累计窗口内。
+
+        窗口比收尾定时器留长一点（`MUTE_ALL_GRACE_MS`），好让收尾之后
+        才到的失败仍能计进这一批，而不是掉进通用错误分支
+        （那条分支会把 `SetInputMute` 这种内部请求名直接弹给用户看）。
+        """
+        if not self._mute_all_started_at:
+            return False
+        elapsed = (time.monotonic() - self._mute_all_started_at) * 1000
+        return elapsed <= MUTE_ALL_SETTLE_MS + MUTE_ALL_GRACE_MS
+
     def _flush_mute_all(self) -> None:
-        failures, self._mute_all_failures = self._mute_all_failures, 0
+        """收尾：把这一批的失败汇总提示一次。"""
         self._mute_all_pending = 0
+        failures = self._mute_all_failures
         if failures:
             self._raise_error_once(f"批量静音：有 {failures} 个音频源没能切换")
-
 
     # ---------------------------------------------------------------- 指令
     def send(self, request_type: str, data: dict | None = None) -> None:
@@ -979,9 +1015,6 @@ class Controller(QObject):
     def _event_input_removed(self, data) -> None:
         self._debounced(self._audio_timer)
 
-    def _event_input_name_changed(self, data) -> None:
-        self._debounced(self._audio_timer)
-
     def _event_input_volume_changed(self, data) -> None:
         name = str(getattr(data, "input_name", "") or "")
         mul = float(getattr(data, "input_volume_mul", 1.0) or 0.0)
@@ -1105,6 +1138,47 @@ class Controller(QObject):
             return
         self.send_if_supported(P.REQ_SAVE_REPLAY_BUFFER)
 
+    # ---- P7：推流字幕（CEA-608）----
+    def caption_supported(self) -> bool:
+        """字幕能力探测：请求名在 availableRequests 里才用。
+
+        `SendStreamCaption` 是 5.0.0 起的请求，但老服务端可能不上报
+        （本项目一律以 `availableRequests` 为准，别靠版本号猜）。
+        """
+        return self.store.supports(P.REQ_SEND_STREAM_CAPTION)
+
+    def stream_caption_blocker(self) -> str:
+        """不能发字幕的原因（空串＝可以发）。
+
+        为什么要在**客户端**先拦一道：服务端对没推流的情况回 501，
+        而"点了没反应 / 弹个英文错误"体验都不好。本地已知没在推流时
+        直接禁用输入并写明原因，用户一眼就知道要去点「开始直播」。
+        """
+        if self.store.connection_state != CONNECTED:
+            return "未连接到 OBS"
+        if not self.caption_supported():
+            return "当前 OBS 不支持推流字幕（SendStreamCaption）"
+        if not self.store.stream.active:
+            return "未在推流，字幕只对直播输出有效"
+        return ""
+
+    def send_stream_caption(self, text: str) -> bool:
+        """发一条 CEA-608 字幕；空串表示**清除当前字幕**。
+
+        返回是否真的下发了。注意 OBS 是"发一条显示一条"的模型：
+        没有"持续显示"的概念，所以这里不做任何本地状态留存 ——
+        留存反而会造出一个 OBS 端并不存在的状态。
+        """
+        blocker = self.stream_caption_blocker()
+        if blocker:
+            logger.warning("字幕未下发：%s", blocker)
+            return False
+        # 只在能力探测不让发时才失败；字段本身必填，但**空串是合法的**
+        # （服务端 ValidateString(..., true) 允许空），空串＝清屏。
+        return self.send_if_supported(
+            P.REQ_SEND_STREAM_CAPTION, {"captionText": text}
+        )
+
     # ---- D8：虚拟摄像机 ----
     def toggle_virtualcam(self) -> None:
         request = (
@@ -1169,6 +1243,17 @@ class Controller(QObject):
         """
         if not self.store.studio_mode:
             logger.warning("T 型推杆未下发：本地认为不在工作室模式")
+            return
+        if not P.tbar_version_ok(self.store.server_info.obs_version):
+            # 这个版本的 OBS 通过 API 根本做不了手动推杆（见 protocol.TBAR_LAST_WORKING_VERSION）。
+            # 界面上已经把推杆藏掉了，这里再拦一道 —— 别对着已知坏掉的 API 发请求。
+            if not self._tbar_version_warned:
+                self._tbar_version_warned = True
+                logger.warning(
+                    "T 型推杆在本版本 OBS（%s）上不可用，已跳过下发："
+                    "obs-studio issue #11372（29.1.0 起失效，修复 PR #13143 未合入）",
+                    self.store.server_info.obs_version or "未知",
+                )
             return
         if not self.send_if_supported(
             P.REQ_SET_TBAR_POSITION,
@@ -1468,18 +1553,55 @@ class Controller(QObject):
             )
 
     def _handle_get_scene_item_enabled(self, data) -> None:
-        if not self._pending_enabled:
+        entry = self._pop_pending_enabled()
+        if entry is None:
             return
-        generation, scene, item_id = self._pending_enabled.popleft()
+        generation, scene, item_id = entry
         if generation != self._items_generation:
             return
         item = self._items_buffer.get(item_id)
         if item is not None:
             item.enabled = bool(getattr(data, "scene_item_enabled", False))
-        if not self._pending_enabled:  # 最后一项返回，整体提交
+
+    def _pop_pending_enabled(self) -> tuple[int, str, int] | None:
+        """取走队首的可见性查询登记；取空即整体提交。
+
+        **成功与失败两条路径都必须经过这里。** 只在成功分支 popleft 会造成两个后果：
+        ①一条查询失败（来源被并发删除 / 超时 / 604）队列就永远清不空，
+          `store.scene_items` 再也提交不了，来源列表**永久空白**；
+        ②队首不推进，后续响应会按位置落到**前一个来源**头上，
+          表现为 A 的可见性被写到 B 上（实测错位一格）。
+        可见性只能靠请求顺序关联（响应不带 sceneItemId），所以队列纪律是唯一约束。
+        """
+        if not self._pending_enabled:
+            return None
+        entry = self._pending_enabled.popleft()
+        if not self._pending_enabled:  # 最后一项落地，整体提交
             items = list(self._items_buffer.values())
             items.reverse()  # 与 OBS 一致：越靠上的来源越先显示
             self.store.set_scene_items(items)
+        return entry
+
+    def _on_pending_enabled_failed(self) -> None:
+        """可见性查询失败：推进队列，并尽量沿用上一次显示的值。
+
+        不沿用的话，失败项会退回构造时的乐观默认值（`enabled=True`），
+        把一个本来是隐藏的来源显示成可见 —— 用户看到的开关就是错的。
+        """
+        entry = self._pop_pending_enabled()
+        if entry is None:
+            return
+        generation, scene, item_id = entry
+        if generation != self._items_generation:
+            return
+        item = self._items_buffer.get(item_id)
+        if item is None:
+            return
+        previous = next(
+            (known for known in self.store.scene_items if known.item_id == item_id), None
+        )
+        if previous is not None:
+            item.enabled = previous.enabled
 
     # ---------------------------------------------------------------- 事件
     @Slot(str, object)
@@ -1569,11 +1691,16 @@ class Controller(QObject):
     def _event_input_name_changed(self, data) -> None:
         old_name = str(getattr(data, "old_input_name", "") or "")
         new_name = str(getattr(data, "input_name", "") or "")
-        if not new_name:
+        if not new_name or old_name == new_name:
             return
-        if not self.store.rename_scene_item_source(old_name, new_name):
-            return
-        # 混音器里的同名源也要跟着改，否则推子会挂到一个已改名的源上
+        # 两件事都要做，**不能因为场景里没引用它就跳过**：
+        # ①当前展示场景里引用该 input 的来源要改名（来源级改名）；
+        # ②混音器里的同名源也要跟着改，否则推子会挂到一个已不存在的名字上。
+        # 以前的写法是 `if not rename_scene_item_source(...): return` ——
+        # 而那个函数只在"当前场景里有来源引用它"时才返回 True，于是
+        # **纯混音器音频源（麦克风、桌面音频等）改名后混音器永不刷新**，
+        # 推子的名字与状态就此失联。两件事是独立的，只是恰好由同一事件触发。
+        self.store.rename_scene_item_source(old_name, new_name)
         self.refresh_audio()
 
     # ---- L：媒体源 ----
@@ -1646,7 +1773,17 @@ class Controller(QObject):
         scene = str(getattr(data, "scene_name", "") or "")
         item_id = int(getattr(data, "scene_item_id", -1))
         enabled = bool(getattr(data, "scene_item_enabled", False))
-        if scene and scene != self.store.current_scene:
+        # 判据必须用 `source_scene`（**来源列表当前展示的那个场景**），
+        # 而不是 `current_scene`（节目场景）。演播室模式下来源列表跟随**预览**场景，
+        # 两者通常不同 —— 用 current_scene 过滤会把预览场景的显隐事件全部丢掉，
+        # 列表于是停在旧值上（用户看到的眼睛开关是错的）。
+        if not scene:
+            # 事件不带 sceneName 时无法判断它属于哪个场景：宁可多一次往返，
+            # 也不能把一条来源不明的显隐事件套到当前列表上（以前这里空值会放行）。
+            logger.debug("SceneItemEnableStateChanged 缺少 sceneName，退回整体刷新")
+            self._debounced(self._items_timer)
+            return
+        if not self._is_active_source_scene(scene):
             return
         self._apply_item_enabled(scene, item_id, enabled)
 
@@ -1963,14 +2100,35 @@ class Controller(QObject):
             self._pop_pending_audio(request_type)
             logger.debug("音频查询 %s 失败：%s", request_type, message)
             return
-        if request_type == P.REQ_SET_INPUT_MUTE and self._mute_all_pending:
-            # E9：批量静音中的单个失败先攒着，等这一批走完再汇总提示一次
+        if request_type == P.REQ_SET_INPUT_MUTE and self._mute_all_in_window():
+            # E9：批量静音窗口内，失败先攒着，收尾时汇总提示一次。
+            # 判据用"是否还在窗口内"而不是"pending 是否 > 0"：
+            # pending 会被收尾定时器清零，此后迟到的失败就再也没人记了。
             self._mute_all_failures += 1
             self._mute_all_pending = max(0, self._mute_all_pending - 1)
             logger.debug("批量静音中 %s 失败：%s", message)
             return
+        if request_type == P.REQ_GET_SCENE_ITEM_ENABLED:
+            # 可见性是逐项查询、**只能按请求顺序关联**（响应不带 sceneItemId）。
+            # 失败时同样必须推进队列，否则队列永久卡住 → 来源列表再也提交不了
+            # （永久空白），且后续响应会错位落到前一个来源头上。
+            self._on_pending_enabled_failed()
+            logger.debug("可见性查询失败（已推进队列）：%s", message)
+            return
         if request_type == P.REQ_SET_TBAR_POSITION:
             self._on_tbar_rejected(code, message)
+            return
+        if (
+            request_type == P.REQ_SEND_STREAM_CAPTION
+            and code == P.ERR_OUTPUT_NOT_RUNNING
+        ):
+            # P7：本地以为在推流、OBS 其实没在推（或刚好处于 STARTING/STOPPING
+            # 这类"还没真正 active"的窗口），服务端回 501。
+            # 这是用户可理解、可纠正的状态，不是程序错误 —— 给中文原因，
+            # 并回读一次推流状态让界面跟上，别让字幕框一直假装能用。
+            logger.warning("字幕被拒：OBS 端当前没有在推流（501）")
+            self._raise_error_once("字幕未发出：OBS 当前没有在推流")
+            self.send(P.REQ_GET_STREAM_STATUS)
             return
         if request_type == P.REQ_TRIGGER_STUDIO_MODE_TRANSITION and (
             code == P.ERR_STUDIO_MODE_NOT_ACTIVE
@@ -2010,7 +2168,9 @@ class Controller(QObject):
             return
         if not transport_lost:
             logger.warning("请求 %s 失败：%s", request_type, message)
-            self._raise_error_once(f"{request_type}：{message}")
+            # 弹框给**用户看得懂的名字**，别把协议里的请求名（GetStats 之类）
+            # 直接丢给用户 —— 那是给我们排障用的，出现在对话框里只会让人困惑。
+            self._raise_error_once(f"{_request_label(request_type)}：{message}")
             return
 
         # 连接级失败才计入掉线判定，且只在"已连接"状态下计。
@@ -2049,12 +2209,28 @@ class Controller(QObject):
         `SetTBarPosition` 会**正常返回 code 100**，但 OBS 端什么都不会发生
         （详见 TBAR_OBS_BUG_HINT 上方的说明）。请求成功 ≠ 功能可用，
         只看回执根本发现不了，所以只能从"结果"反推。
+
+        ⚠️ **场景未知时一律不武装**。判据是"节目场景变了没有"，
+        而基线取自 `current_scene`；连接后场景列表到达之前它是空串，
+        此时"空串 → 任意场景名"必然成立，于是到点必然被判成"OBS 有反应"，
+        自检**静默失效**，用户永远收不到推杆已失效的提示。
+        宁可不武装（并留一条 debug），也不要拿一个恒真的判据去下结论。
         """
-        self._tbar_check_scene = self.store.current_scene
+        baseline = self.store.current_scene
+        if not baseline:
+            logger.debug("推杆自检未武装：当前节目场景未知（场景列表尚未到达）")
+            self._tbar_check_scene = ""
+            self._tbar_effect_timer.stop()
+            return
+        self._tbar_check_scene = baseline
         self._tbar_effect_timer.start(TBAR_NO_EFFECT_CHECK_MS)
 
     @Slot()
     def _on_tbar_effect_check(self) -> None:
+        # 基线为空表示这次自检本来就不该武装（见 _arm_tbar_effect_check）。
+        # 兜一道：绝不能在"基线未知"的情况下报结论。
+        if not self._tbar_check_scene:
+            return
         if self.store.transitioning or self.store.current_scene != self._tbar_check_scene:
             return  # 有动静，OBS 是理会的
         logger.warning("推杆请求返回成功，但 OBS 端没有任何转场动作 —— 判定为已知的 OBS 侧缺陷")
@@ -2137,3 +2313,50 @@ def _payload_to_tracks(payload) -> int:
 
 def _tracks_to_payload(mask: int) -> dict[str, bool]:
     return {str(index): bool(mask & (1 << (index - 1))) for index in range(1, 7)}
+
+
+# 失败提示里用的**用户可读**名称。
+# 协议请求名（GetStats / SetInputMute…）是给排障看的，直接弹给用户只会让人
+# 困惑"这是什么"。没有登记的一律回落到"操作"这种中性说法，
+# 详细的请求名仍然照常写进日志（logger.warning 那一行不受影响）。
+_REQUEST_LABELS: dict[str, str] = {
+    P.REQ_START_RECORD: "开始录制",
+    P.REQ_STOP_RECORD: "停止录制",
+    P.REQ_PAUSE_RECORD: "暂停录制",
+    P.REQ_RESUME_RECORD: "继续录制",
+    P.REQ_START_STREAM: "开始直播",
+    P.REQ_STOP_STREAM: "停止直播",
+    P.REQ_SET_CURRENT_PROGRAM_SCENE: "切换场景",
+    P.REQ_SET_CURRENT_PREVIEW_SCENE: "设置预览场景",
+    P.REQ_SET_SCENE_ITEM_ENABLED: "切换来源可见性",
+    P.REQ_CREATE_SCENE: "新建场景",
+    P.REQ_REMOVE_SCENE: "删除场景",
+    P.REQ_SET_SCENE_NAME: "重命名场景",
+    P.REQ_SET_SCENE_INDEX: "调整场景顺序",
+    P.REQ_SET_CURRENT_SCENE_TRANSITION: "切换转场",
+    P.REQ_SET_TRANSITION_DURATION: "设置转场时长",
+    P.REQ_TRIGGER_STUDIO_MODE_TRANSITION: "执行转场",
+    P.REQ_SET_STUDIO_MODE_ENABLED: "切换工作室模式",
+    P.REQ_SET_TBAR_POSITION: "T 型推杆",
+    P.REQ_START_REPLAY_BUFFER: "开启回放缓冲",
+    P.REQ_STOP_REPLAY_BUFFER: "关闭回放缓冲",
+    P.REQ_SAVE_REPLAY_BUFFER: "保存回放",
+    P.REQ_START_VIRTUALCAM: "开启虚拟摄像机",
+    P.REQ_STOP_VIRTUALCAM: "关闭虚拟摄像机",
+    P.REQ_SET_INPUT_VOLUME: "调节音量",
+    P.REQ_SET_INPUT_MUTE: "切换静音",
+    P.REQ_SET_INPUT_AUDIO_MONITOR_TYPE: "设置监听类型",
+    P.REQ_SET_INPUT_AUDIO_BALANCE: "设置声道平衡",
+    P.REQ_SET_INPUT_AUDIO_SYNC_OFFSET: "设置同步偏移",
+    P.REQ_SET_INPUT_AUDIO_TRACKS: "设置混音轨",
+    P.REQ_TRIGGER_MEDIA_INPUT_ACTION: "媒体控制",
+    P.REQ_SET_MEDIA_INPUT_CURSOR: "媒体跳转",
+    P.REQ_SET_CURRENT_SCENE_COLLECTION: "切换场景集合",
+    P.REQ_SET_CURRENT_PROFILE: "切换配置文件",
+    P.REQ_SEND_STREAM_CAPTION: "发送字幕",
+}
+
+
+def _request_label(request_type: str) -> str:
+    """请求名 -> 用户可读的操作名（未登记时用中性说法，别泄漏内部名字）。"""
+    return _REQUEST_LABELS.get(request_type, "操作")

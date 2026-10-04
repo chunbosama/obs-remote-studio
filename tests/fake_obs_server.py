@@ -134,6 +134,8 @@ class FakeObsState:
         self.tbar_calls = 0
         # 推杆正把一次转场"推"在半途 —— 此时真实 OBS 处于 busy 状态
         self.tbar_transitioning = False
+        # P7：推流字幕。记录收到的每一条（含空串＝清屏），供测试断言
+        self.captions: list[str] = []
         # D17：录制目录（客户端据此算剩余空间）
         self.record_directory = "D:/record"
         # E：音频。混音器里"能出声"的源与纯视频源混在一起，用来验证过滤逻辑
@@ -175,6 +177,7 @@ class FakeObsServer:
         config_switch: bool = True,
         tbar: bool = True,
         tbar_silent: bool = False,
+        obs_version: str = "",
     ):
         """legacy_transitions=True：模拟 obs-websocket 5.0，只认 GetTransitionList。
         hide_available_requests=True：GetVersion 不上报 availableRequests，
@@ -203,12 +206,16 @@ class FakeObsServer:
         self.tbar = tbar
         # True：忠实模拟 OBS ≥29.1 的缺陷 —— SetTBarPosition 返回成功但什么都不做
         self.tbar_silent = tbar_silent
+        # 上报的 OBS 版本（"" = 用默认值）。T 型推杆的显隐跟版本有关，
+        # 所以测试要能在 29.0.2 与 31.x 之间切换。
+        self.obs_version = obs_version
         self.state = FakeObsState()
         self.requests: list[str] = []
 
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._ready = threading.Event()
+        self._startup_error: BaseException | None = None
         self._server: Any = None
         self._stop_future: Any = None
         self._connections: set[Any] = set()
@@ -216,8 +223,26 @@ class FakeObsServer:
 
     # ---------------------------------------------------------------- 生命周期
     def start(self) -> int:
+        """启动服务器并返回实际端口；**起不来就抛异常，绝不假装成功**。
+
+        以前的写法是 `self._ready.wait(10)` 之后直接 `return self.port`：
+        bind 失败发生在服务器线程里，`_ready` 永远不被 set，于是 10 秒后
+        这里若无其事地返回一个**根本没人在听的端口** —— 测试随后会在
+        连接超时上失败，报错指向一个完全不相干的地方（实测端口被占用时
+        就是这样，极难排查）。测试基础设施静默失败比产品代码失败更贵。
+        """
         self._thread.start()
-        self._ready.wait(10)
+        ready = self._ready.wait(10)
+        # 先看有没有启动错误：失败路径也会 set _ready（为的是不让这里白等 10 秒），
+        # 所以判据不能只看 ready 是否为 True。
+        if isinstance(self._startup_error, BaseException):
+            raise RuntimeError(
+                f"假 OBS 服务器启动失败（{self.host}:{self.port}）：{self._startup_error}"
+            ) from self._startup_error
+        if not ready:
+            raise RuntimeError(
+                f"假 OBS 服务器 10 秒内未就绪（{self.host}:{self.port}），端口可能被占用"
+            )
         return self.port
 
     def stop(self) -> None:
@@ -233,7 +258,12 @@ class FakeObsServer:
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._serve())
+        try:
+            self._loop.run_until_complete(self._serve())
+        except BaseException as exc:  # noqa: BLE001 - 记下来交给 start() 抛出
+            self._startup_error = exc
+            # 唤醒可能在等的 start()，别让它白等满 10 秒
+            self._ready.set()
 
     async def _serve(self) -> None:
         async with websockets.serve(self._handler, self.host, self.port) as server:
@@ -292,6 +322,8 @@ class FakeObsServer:
             "StartStream",
             "StopStream",
             "GetStreamStatus",
+            # P7：推流字幕（5.0.0 起就有）
+            "SendStreamCaption",
             "GetStats",
             "GetVideoSettings",
             "GetSourceScreenshot",
@@ -482,7 +514,8 @@ class FakeObsServer:
         st = self.state
         if req_type == "GetVersion":
             return {
-                "obsVersion": "31.0.0" if not self.legacy_transitions else "28.0.0",
+                "obsVersion": self.obs_version
+                or ("31.0.0" if not self.legacy_transitions else "28.0.0"),
                 "obsWebSocketVersion": "5.5.0" if not self.legacy_transitions else "5.0.1",
                 "rpcVersion": 1,
                 "availableRequests": [] if self.hide_available_requests else self.available_requests(),
@@ -629,6 +662,18 @@ class FakeObsServer:
                 "outputSkippedFrames": 3,
                 "outputTotalFrames": 1800,
             }, None
+        if req_type == "SendStreamCaption":
+            # P7：照抄真实服务端（RequestHandler_Stream.cpp）的语义：
+            #   ① 先查 obs_frontend_streaming_active()，没推流直接 501 OutputNotRunning；
+            #   ② captionText 必填但**允许空串**（空串＝清除当前字幕）；
+            #   ③ 它不产生任何事件、也不改状态 —— 只是把文本交给输出。
+            # 注意别在这里"顺手"加个字幕状态回显：真实 OBS 没有可查询的字幕状态，
+            # 假服务器凭空造能力会把"客户端不该依赖这个状态"这件事掩盖掉。
+            if not st.stream_active:
+                return None, ("__error__", (501, "Output is not running"))
+            caption = str(payload.get("captionText", ""))
+            st.captions.append(caption)
+            return None, None
         if req_type == "GetStats":
             return {
                 "cpuUsage": 7.5,
