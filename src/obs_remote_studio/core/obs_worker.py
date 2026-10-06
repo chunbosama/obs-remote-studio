@@ -6,6 +6,10 @@
     worker.moveToThread(thread)
     thread.start()
     worker.request_connect.emit(cfg_dict)   # 跨线程调用槽函数
+
+支持两代协议：**v5（标准模式）** 走 obsws-python；**v4（兼容模式，OBS ≤ 27）**
+走本项目的 `client_v4`（伪装成同样的 ReqClient/EventClient 接口）。
+选择方式是连接时探测：v5 连上就会发 op=0 Hello，v4 则一直静默 —— 见 client_v4.detect_protocol。
 """
 
 from __future__ import annotations
@@ -23,6 +27,8 @@ from websocket import (
 )
 
 from . import protocol as P
+from . import protocol_v4 as V4
+from .client_v4 import V4EventClient, V4ReqClient, detect_protocol
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +92,9 @@ class ObsWorker(QObject):
         self._events: EventClient | None = None
         self._timeout: float = 3.0
         self._subscriptions: int = P.SUBSCRIPTION_MASK
+        # 当前连接的协议：v5 = 标准模式，v4 = 兼容模式。连接时由探测决定，
+        # 未连接时按 v5（默认）记，供标题/状态栏在断开后仍显示上次的模式。
+        self._protocol: str = V4.MODE_STANDARD
         # 会话号：每次 _on_connect 递增。请求在发出时记下自己的会话号，
         # 回来时若已不是当前会话，说明这条结果属于上一条连接，一律作废。
         # 与 _on_connect/_on_execute 都跑在 worker 线程、天然串行配合，不需要加锁。
@@ -116,16 +125,39 @@ class ObsWorker(QObject):
         self._safe_close()
         self._session += 1
 
+        # 用户显式指定协议就不探测（连接对话框里可以钉死 v5/v4），
+        # 否则连上先判一次：v5 会立刻发 Hello，v4 一直静默。
+        wanted = str(cfg.get("protocol", "auto") or "auto")
+        if wanted in (V4.MODE_STANDARD, V4.MODE_COMPAT):
+            protocol = wanted
+        else:
+            try:
+                protocol = detect_protocol(host, port, self._timeout)
+            except (ConnectionRefusedError, TimeoutError, WebSocketTimeoutException) as exc:
+                self.connect_failed.emit(FAIL_REFUSED, str(exc) or "无法连接到 OBS")
+                return
+            except (OBSSDKError, WebSocketException, OSError) as exc:
+                self.connect_failed.emit(self._classify(exc, password), str(exc))
+                return
+        self._protocol = protocol
+        logger.info("协议探测结果：%s（%s）", protocol, V4.mode_label(protocol))
+
         try:
-            # 请求连接必须 subs=0：一旦订阅事件，事件帧会混进请求/响应流，
-            # obsws-python 的 req() 会把事件当成响应解析。事件一律走 EventClient。
-            self._req = ReqClient(
-                host=host,
-                port=port,
-                password=password,
-                subs=0,
-                timeout=self._timeout,
-            )
+            if protocol == V4.MODE_COMPAT:
+                # v4：没有订阅位掩码，一条连接既收响应也收事件（见 client_v4 说明）
+                self._req = V4ReqClient(
+                    host=host, port=port, password=password, timeout=self._timeout
+                )
+            else:
+                # 请求连接必须 subs=0：一旦订阅事件，事件帧会混进请求/响应流，
+                # obsws-python 的 req() 会把事件当成响应解析。事件一律走 EventClient。
+                self._req = ReqClient(
+                    host=host,
+                    port=port,
+                    password=password,
+                    subs=0,
+                    timeout=self._timeout,
+                )
         except OBSSDKError as exc:
             self.connect_failed.emit(self._classify(exc, password), str(exc))
             return
@@ -148,11 +180,15 @@ class ObsWorker(QObject):
         self.result_ready.emit(P.REQ_GET_VERSION, version)
         self.connected.emit(
             {
+                "protocol": protocol,
                 "obs_version": getattr(version, "obs_version", ""),
-                "websocket_version": getattr(version, "obs_web_socket_version", ""),
+                # v4 客户端把 obs-websocket-version 也放进了这个字段
+                "websocket_version": getattr(version, "obs_web_socket_version", "")
+                or getattr(version, "websocket_version", ""),
                 "rpc_version": getattr(version, "rpc_version", 0),
                 # availableRequests 是能力探测的唯一依据：
                 # 有没有 GetSceneTransitionList 之类的差异全靠它，别靠猜。
+                # v4 那边已经在 client_v4 里合成成了 **v5 请求名**，两侧口径一致。
                 "available_requests": list(getattr(version, "available_requests", []) or []),
             }
         )
@@ -160,21 +196,41 @@ class ObsWorker(QObject):
 
     def _start_event_client(self, host: str, port: int, password: str) -> None:
         try:
-            self._events = EventClient(
-                host=host,
-                port=port,
-                password=password,
-                subs=self._subscriptions,
-                timeout=self._timeout,
-            )
+            if self._protocol == V4.MODE_COMPAT:
+                self._events = V4EventClient(
+                    host=host, port=port, password=password, timeout=self._timeout
+                )
+            else:
+                self._events = EventClient(
+                    host=host,
+                    port=port,
+                    password=password,
+                    subs=self._subscriptions,
+                    timeout=self._timeout,
+                )
         except Exception as exc:  # noqa: BLE001
             self._events = None
             self.event_link_failed.emit(str(exc))
             return
 
-        handlers = [self._make_callback(evt, cb) for evt, cb in P.EVENTS.items()]
+        handlers = [self._make_callback(evt, cb) for evt, cb in self._event_handlers().items()]
         self._events.callback.register(handlers)
         self.event_link_ready.emit()
+
+    def _event_handlers(self) -> dict[str, str]:
+        """本项目关心的事件 -> 回调名。
+
+        v4 侧 `client_v4` 已经把 v4 事件名翻译成了 v5 名字，所以**用同一张表**；
+        只是把 v4 根本不存在的电平表事件剔掉（v4 没有任何电平表能力，
+        订了也永远收不到，留着只会让人误以为"应该是有的"）。
+        """
+        if self._protocol == V4.MODE_COMPAT:
+            return {
+                evt: cb
+                for evt, cb in P.EVENTS.items()
+                if evt != "InputVolumeMeters"
+            }
+        return dict(P.EVENTS)
 
     @Slot()
     def _on_retry_event_link(self) -> None:

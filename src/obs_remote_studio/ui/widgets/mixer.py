@@ -338,6 +338,8 @@ class MixerPanel(DockPanel):
         store.audio_input_changed.connect(self._update_row)
         store.connection_state_changed.connect(self._on_connection_state)
         store.capabilities_changed.connect(self._update_buttons)
+        # v4 兼容模式下没有电平表事件，电平条要收起来（见 _update_meters）
+        store.compat_mode_changed.connect(self._update_meters)
 
         self._update_buttons()
         self.rebuild()
@@ -356,6 +358,22 @@ class MixerPanel(DockPanel):
         self.advanced_button.setEnabled(self.store.supports(P.REQ_GET_INPUT_AUDIO_TRACKS))
         self.unit_button.setText("%" if self.callbacks["show_percent"]() else "dB")
         self._update_mute_all()
+        self._update_meters()
+
+    def _update_meters(self) -> None:
+        """v4 没有电平表事件 —— 藏掉电平条，别画一排永远为 0 的死条。
+
+        这不是"省点事"：`InputVolumeMeters` 在 obs-websocket v4 里**完全不存在**
+        （没有任何电平表请求或事件，唯一的音频活跃信号是 `GetAudioActive` 的布尔值）。
+        留着一个永远不动的电平条，用户只会以为软件坏了。
+        """
+        compat = self.store.compat_mode
+        for row in self._rows.values():
+            row.meter.setVisible(not compat)
+            row.meter.setToolTip(
+                "obs-websocket v4（兼容模式）没有电平表事件，无法显示电平"
+                if compat else ""
+            )
 
     def _update_mute_all(self) -> None:
         """还有没静音的就显示「全静音」，全静音了就显示「取消全静音」。"""

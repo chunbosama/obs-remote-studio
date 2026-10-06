@@ -198,7 +198,18 @@ class StatusBar(QStatusBar):
         self.target_label.setText(message)
 
     def _update_version(self, info) -> None:
-        self.version_label.setText(info.label())
+        # 版本段兼作"协议模式"指示：v4（兼容模式）下写清"兼容模式"，
+        # 免得用户以为功能缺失是软件坏了。v5 时不加后缀，保持原本的简洁。
+        text = info.label()
+        if getattr(info, "protocol", "v5") == "v4":
+            self.version_label.setText(f"{text} · 兼容模式（v4）")
+            self.version_label.setToolTip(
+                "以 obs-websocket v4（OBS ≤ 27）兼容模式连接：\n"
+                "v4 没有的组件（电平表、声道平衡、删除场景等）已自动隐藏或置灰。"
+            )
+        else:
+            self.version_label.setText(text)
+            self.version_label.setToolTip("")
 
     def refresh_icons(self) -> None:
         """换主题后重画信号格与分隔线。"""

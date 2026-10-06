@@ -87,6 +87,9 @@ class AppSettings:
         cfg.quick_transitions = self._load_quick_transitions()
         cfg.status_segments = self._load_str_list("ui/status_segments")
         cfg.compact_mode = self._get("ui/compact_mode", False, bool)
+        # 协议：auto / v5 / v4。坏值一律回落 auto（理由同其它配置项）
+        protocol = str(self._get("connection/protocol", "auto") or "auto").lower()
+        cfg.protocol = protocol if protocol in ("auto", "v5", "v4") else "auto"
         return cfg
 
     def _load_hidden_inputs(self) -> list[str]:
@@ -178,6 +181,7 @@ class AppSettings:
             "ui/status_segments", json.dumps(list(cfg.status_segments), ensure_ascii=False)
         )
         self._qs.setValue("ui/compact_mode", cfg.compact_mode)
+        self._qs.setValue("connection/protocol", getattr(cfg, "protocol", "auto"))
         self._qs.sync()
 
     # ------------------------------------------------------------ 最近连接

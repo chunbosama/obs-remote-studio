@@ -89,12 +89,21 @@ class AdvancedAudioDialog(QDialog):
             balance.setDecimals(2)
             balance.setValue(0.5)
             balance.valueChanged.connect(lambda value, r=row: self._on_balance(r, value))
+            # v4 没有声道平衡（GetAudioBalance/SetAudioBalance 在 v4 里根本不存在），
+            # 置灰并说明原因，别摆一个点了没反应的控件
+            if not self.store.supports(P.REQ_SET_INPUT_AUDIO_BALANCE):
+                balance.setEnabled(False)
+                balance.setToolTip(self.store.support_reason(P.REQ_SET_INPUT_AUDIO_BALANCE))
             self.table.setCellWidget(row, COL_BALANCE, balance)
 
             sync = QSpinBox()
             sync.setRange(-950, 20000)
             sync.setSuffix(" ms")
+            sync.setToolTip("音频同步偏移")
             sync.valueChanged.connect(lambda value, r=row: self._on_sync(r, value))
+            if not self.store.supports(P.REQ_SET_INPUT_AUDIO_SYNC_OFFSET):
+                sync.setEnabled(False)
+                sync.setToolTip(self.store.support_reason(P.REQ_SET_INPUT_AUDIO_SYNC_OFFSET))
             self.table.setCellWidget(row, COL_SYNC, sync)
 
             tracks = QWidget()

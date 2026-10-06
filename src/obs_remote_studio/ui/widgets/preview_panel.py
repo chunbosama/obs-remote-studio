@@ -393,7 +393,14 @@ class _TransitionColumn(QWidget):
     def _tbar_block_reason(self) -> str:
         """**不能用**的原因，按"最该先解决的那一条"排。"""
         if not self.store.supports("SetTBarPosition"):
-            return "当前 OBS 不支持 T 型推杆（需要 obs-websocket 5.x）"
+            # v4 里 SetTBarPosition 只有 4.9.0+ 才有；本项目的合成能力表
+            # 只在 v4 上把它算作支持，所以这里要写清是"协议没有"还是"版本不够"
+            if self.store.compat_mode:
+                return (
+                    "obs-websocket v4（兼容模式）没有 T 型推杆请求"
+                    "（需要 v4.9.0 及以上，或升级到 OBS ≥ 28 的 v5）"
+                )
+            return "当前 OBS 不支持 T 型推杆"
         if not self.store.studio_mode:
             return "需要先在 OBS 里开启工作室模式（Studio Mode）"
         if self.store.is_unavailable("SetTBarPosition"):

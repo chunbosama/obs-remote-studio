@@ -62,6 +62,9 @@ class StateStore(QObject):
     # GetVersion 返回的 availableRequests，用于能力探测
     capabilities_changed = Signal()
 
+    # obs-websocket v4 兼容模式：为 True 时 v4 不支持的组件要隐藏/置灰
+    compat_mode_changed = Signal()
+
     # A11：连接健康（RTT / 卡顿）
     health_changed = Signal()
     # D17：磁盘与时长预警
@@ -104,6 +107,11 @@ class StateStore(QObject):
         self.transitioning: bool = False
         self.supported_requests: set[str] = set()
         self.rejected_requests: set[str] = set()  # 服务端明确回过 204 的请求
+        # obs-websocket v4 兼容模式（OBS ≤ 27）。单独的布尔量是给"能力列表本身
+        # 无法表达"的差异用的：v4 的音轨请求在**4.9.1 才齐全**，更老的版本
+        # availableRequests 里也有 GetTracks，但 SetTracks 的行为不同，
+        # 这类地方需要显式判断。
+        self.compat_mode: bool = False
         # 服务端回过 604：请求名合法，但这台机器上该资源当前不可用
         # （没配回放缓冲、虚拟摄像机驱动缺失…）。用于把对应按钮置灰。
         self.unavailable_requests: set[str] = set()
@@ -380,6 +388,15 @@ class StateStore(QObject):
         self.unavailable_reasons.clear()
         self.capabilities_changed.emit()
 
+    def set_compat_mode(self, enabled: bool) -> None:
+        """切换 obs-websocket v4 兼容模式（连接建立时按探测结果设）。"""
+        enabled = bool(enabled)
+        if enabled == self.compat_mode:
+            return
+        self.compat_mode = enabled
+        self.compat_mode_changed.emit()
+        self.capabilities_changed.emit()
+
     def mark_unsupported(self, request_type: str) -> None:
         """服务端回过 204，此后不再发这个请求。"""
         if request_type in self.rejected_requests:
@@ -421,8 +438,27 @@ class StateStore(QObject):
         # 老服务端不上报 availableRequests 时按乐观处理，被拒后由 mark_unsupported 兜住
         return not self.supported_requests or request_type in self.supported_requests
 
+    def support_reason(self, request_type: str) -> str:
+        """某个请求**为什么用不了**（能用则回空串），给界面置灰说明用。
+
+        本项目的老规矩：置灰必须写清原因，否则用户只会以为功能坏了。
+        兼容模式下原因与 v5 不同 —— 不是"OBS 版本太老"，而是
+        "obs-websocket v4 协议里根本没有这条请求"，措辞要分开。
+        """
+        if self.supports(request_type) and not self.is_unavailable(request_type):
+            return ""
+        if self.is_unavailable(request_type):
+            return self.unavailable_reason(request_type) or "OBS 当前不接受该请求"
+        if self.compat_mode:
+            return "obs-websocket v4（兼容模式）没有这项能力，请在 OBS 端操作或升级 OBS ≥ 28"
+        return "当前 OBS 版本不支持该请求"
+
     def reset_runtime_state(self) -> None:
-        """断开时清空，避免残留旧状态误导操作。"""
+        """断开时清空，避免残留旧状态误导操作。
+
+        **不重置 compat_mode / server_info**：断开后标题与状态栏仍应显示
+        "上次连的是标准还是兼容模式"，否则一断线用户就看不出差异了。
+        """
         self.scenes = []
         self.current_scene = ""
         self.scene_items = []

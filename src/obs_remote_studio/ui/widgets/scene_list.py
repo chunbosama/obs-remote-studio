@@ -128,19 +128,31 @@ class ScenePanel(QWidget):
         self.add_btn.setEnabled(editable)
         self.remove_btn.setEnabled(editable and self._can_remove_current())
         if not editable:
-            tip = "场景编辑：当前 OBS 版本不支持，按钮暂不可用"
+            tip = self.store.support_reason(P.REQ_CREATE_SCENE) or "场景编辑当前不可用"
             self.add_btn.setToolTip(tip)
             self.remove_btn.setToolTip(tip)
         else:
             self.add_btn.setToolTip("新建场景")
-            self.remove_btn.setToolTip(
-                "删除场景" if self._can_remove_current() else "至少要保留一个场景"
-            )
+            # 删除场景在 v4 上**根本没有对应请求**（v4 无 RemoveScene），
+            # 所以这里必须按能力判断，不能只看"能不能编辑"
+            if not self.store.supports(P.REQ_REMOVE_SCENE):
+                self.remove_btn.setEnabled(False)
+                self.remove_btn.setToolTip(
+                    self.store.support_reason(P.REQ_REMOVE_SCENE)
+                    or "当前服务端不支持删除场景"
+                )
+            else:
+                self.remove_btn.setToolTip(
+                    "删除场景" if self._can_remove_current() else "至少要保留一个场景"
+                )
         for button in (self.up_btn, self.down_btn):
             button.setEnabled(reorderable)
             button.setToolTip(
                 "调整场景顺序" if reorderable
-                else "调整场景顺序：当前 OBS 版本不支持（SetSceneIndex），暂不可用"
+                else (
+                    self.store.support_reason(P.REQ_SET_SCENE_INDEX)
+                    or "调整场景顺序当前不可用"
+                )
             )
         # 不支持排序时连拖拽也禁掉，免得拖了个寂寞
         self.list_widget.setDragEnabled(reorderable)

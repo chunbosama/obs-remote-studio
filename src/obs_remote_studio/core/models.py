@@ -156,10 +156,17 @@ class ServerInfo:
     obs_version: str = ""
     websocket_version: str = ""
     rpc_version: int = 0
+    # 协议模式：v5 = 标准模式，v4 = 兼容模式（见 protocol_v4）。
+    # 存的是常量字符串，不引 Qt/协议模块进来，保持 models 无依赖。
+    protocol: str = "v5"
 
     def label(self) -> str:
         parts = [p for p in (self.obs_version, f"ws {self.websocket_version}") if p]
         return " / ".join(parts) if parts else "未知版本"
+
+    def mode_label(self) -> str:
+        """'标准模式' / '兼容模式' —— 标题与状态栏都用它。"""
+        return "兼容模式" if self.protocol == "v4" else "标准模式"
 
 
 @dataclass
@@ -216,3 +223,8 @@ class AppConfig:
     status_segments: list[str] = field(default_factory=list)
     # H10：紧凑/迷你模式
     compact_mode: bool = False
+
+    # 协议：auto = 连接时自动探测（v5 连上立刻发 Hello，v4 一直静默；
+    # 见 client_v4.detect_protocol）。也可强制 "v5" / "v4"，
+    # 用于中间有代理缓冲首帧、探测可能判错的环境。
+    protocol: str = "auto"

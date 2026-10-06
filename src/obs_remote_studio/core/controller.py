@@ -34,6 +34,7 @@ from .models import (
     VirtualcamStatus,
 )
 from .obs_worker import FAIL_AUTH, FAIL_REFUSED, FAIL_TIMEOUT, ObsWorker
+from . import protocol_v4 as P4
 from .settings import AppSettings
 from .state_store import (
     CONNECTED,
@@ -284,23 +285,30 @@ class Controller(QObject):
             "port": conn.port,
             "password": conn.password,
             "timeout": self.config.request_timeout_s,
-            # 电平表是高频事件，是否订阅在连接时定；改了要重连才生效
+            # 电平表是高频事件，是否订阅在连接时定；改了要重连才生效。
+            # （v4 没有订阅机制，这个字段会被 v4 客户端忽略。）
             "subscription_mask": P.subscription_mask(self.config.audio_meters),
+            # auto / v5 / v4 —— auto 时由 worker 探测
+            "protocol": getattr(self.config, "protocol", "auto"),
         }
 
     @Slot(dict)
     def _on_connected(self, info: dict) -> None:
         self._attempt = 0
         self._transport_failures = 0
+        protocol = str(info.get("protocol", P4.MODE_STANDARD) or P4.MODE_STANDARD)
         self.store.set_server_info(
             ServerInfo(
                 obs_version=str(info.get("obs_version", "")),
                 websocket_version=str(info.get("websocket_version", "")),
                 rpc_version=int(info.get("rpc_version", 0) or 0),
+                protocol=protocol,
             )
         )
         # 能力列表来自握手时那次 GetVersion，必须在 refresh_all 之前就位，
         # 否则 _refresh_transitions 只能靠"发了被拒"来试错。
+        # v4 会话里这份列表**已经是合成的 v5 请求名**（见 client_v4 / protocol_v4），
+        # 所以下面的能力探测与界面显隐逻辑对两代协议一视同仁。
         self.store.set_capabilities(info.get("available_requests") or [])
         self.store.set_tbar_ignored(False)
         self._tbar_version_warned = False
@@ -311,12 +319,24 @@ class Controller(QObject):
         self._heartbeat_pending = False
         self.store.set_health(ConnectionHealth())
 
-        version = P.parse_version(str(info.get("websocket_version", "")))
-        if version and version < (5, 0):
-            self.store.error_raised.emit(
-                "协议版本过低",
-                f"检测到 obs-websocket {info.get('websocket_version')}，MVP 需要 v5（OBS ≥ 28）。",
+        if protocol == P4.MODE_COMPAT:
+            # 兼容模式：v4 没有电平表事件，订了也收不到；本地标记一下，
+            # 让混音器把电平条藏掉而不是画一排永远为 0 的死条。
+            self.store.set_compat_mode(True)
+            logger.info(
+                "已用 obs-websocket v4（兼容模式）连接：OBS %s / ws %s；"
+                "v4 不支持的组件已自动隐藏或置灰",
+                info.get("obs_version") or "未知",
+                info.get("websocket_version") or "未知",
             )
+        else:
+            self.store.set_compat_mode(False)
+            version = P.parse_version(str(info.get("websocket_version", "")))
+            if version and version < (5, 0):
+                self.store.error_raised.emit(
+                    "协议版本过低",
+                    f"检测到 obs-websocket {info.get('websocket_version')}，需要 v5（OBS ≥ 28）。",
+                )
         # 状态栏自己会显示"已连接"，这里只给地址，免得读成"已连接 已连接 …"
         conn = self.config.connection
         self.store.set_connection_state(CONNECTED, conn.label())
@@ -593,6 +613,15 @@ class Controller(QObject):
             warning.free_gb = free_gb
         self.store.set_record_warning(warning)
 
+    @property
+    def record_directory(self) -> str:
+        """OBS 端当前的录像目录（拿不到就回空串）。
+
+        给「设置 → 输出 → 录像路径」做只读对照用：D17 算剩余空间时本来就要问
+        这个值，顺手暴露出来，省得设置窗口再发一次 GetRecordDirectory。
+        """
+        return self._record_directory
+
     def _free_space_gb(self) -> float | None:
         if not self._record_directory:
             return None
@@ -715,8 +744,11 @@ class Controller(QObject):
         )
 
     def set_balance(self, name: str, balance: float) -> None:
+        # v4 **没有**声道平衡（GetAudioBalance/SetAudioBalance 在 v4 的
+        # requestMap 里根本不存在），能力探测会把它挡掉。这里用 send_if_supported
+        # 而不是直接 send：否则每次都会白发一条注定 204 的请求。
         self.store.update_audio_input(name, balance=balance)
-        self.send(
+        self.send_if_supported(
             P.REQ_SET_INPUT_AUDIO_BALANCE,
             {"inputName": name, "inputAudioBalance": balance},
         )
@@ -1049,12 +1081,22 @@ class Controller(QObject):
         """D6：录制暂停要 ws 5.1+ / OBS 30+，两个条件都满足才放行按钮。
 
         `availableRequests` 才是权威依据；版本号只作为老服务端不上报能力时的兜底。
+        v4 侧由能力合成处理：`PauseRecording`/`ResumeRecording` 是 **4.7.0** 才有的，
+        更老的 v4 不会出现在 availableRequests 里，于是自动置灰。
         """
         if self.store.rejected_requests and P.REQ_PAUSE_RECORD in self.store.rejected_requests:
             return False
         if self.store.supported_requests:
             return self.store.supports(P.REQ_PAUSE_RECORD)
         return P.version_at_least(self.store.server_info.websocket_version, (5, 1))
+
+    def support_reason(self, request_type: str) -> str:
+        """某个请求**为什么用不了**，给界面上的 tooltip / 提示文字用。
+
+        逻辑落在 `StateStore.support_reason`（界面控件只有 store，拿不到 controller），
+        这里保留一个同名入口，方便控制器自己判断时调用。
+        """
+        return self.store.support_reason(request_type)
 
     def switch_scene(self, name: str) -> None:
         if not name or name == self.store.current_scene:
@@ -1348,7 +1390,10 @@ class Controller(QObject):
             return
         # 不由本地乐观插入：名字是否合法由服务端说了算（非法字符等），
         # 等 SceneCreated 事件/GetSceneList 回执再落状态更稳。
-        self.send(P.REQ_CREATE_SCENE, {"sceneName": name})
+        # 能力探测同样拦一道：v4 的 CreateScene 是 **4.9.0** 才有的。
+        if not self.send_if_supported(P.REQ_CREATE_SCENE, {"sceneName": name}):
+            self._raise_error_once(f"当前服务端不支持新建场景：{name}")
+            return
         self.send(P.REQ_GET_SCENE_LIST)
 
     def rename_scene(self, old_name: str, new_name: str) -> None:
@@ -1362,14 +1407,24 @@ class Controller(QObject):
         if self.scene_exists(new_name):
             self._raise_error_once(f"已存在名为「{new_name}」的场景")
             return
-        self.send(P.REQ_SET_SCENE_NAME, {"sceneName": old_name, "newSceneName": new_name})
+        # 能力探测拦一道：v4 没有 SetSceneName，走的是 SetSourceName（4.8.0+）
+        if not self.send_if_supported(
+            P.REQ_SET_SCENE_NAME, {"sceneName": old_name, "newSceneName": new_name}
+        ):
+            self._raise_error_once("当前服务端不支持重命名场景")
+            return
         self.send(P.REQ_GET_SCENE_LIST)
 
     def remove_scene(self, name: str) -> None:
         name = (name or "").strip()
         if not name or not self.scene_exists(name):
             return
-        self.send(P.REQ_REMOVE_SCENE, {"sceneName": name})
+        # v4 **没有**任何删除场景的请求，能力探测会把 RemoveScene 挡在外面。
+        # 界面上的按钮已置灰，但托盘/热键/将来自动化都可能绕过 UI 调到这里，
+        # 所以在这一层也收一道，别对着已知不存在的能力发请求。
+        if not self.send_if_supported(P.REQ_REMOVE_SCENE, {"sceneName": name}):
+            logger.warning("服务端不支持 %s，删除场景已跳过（v4 无此能力）", P.REQ_REMOVE_SCENE)
+            return
         self.send(P.REQ_GET_SCENE_LIST)
 
     def can_remove_scene(self, name: str) -> bool:

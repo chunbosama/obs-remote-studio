@@ -43,7 +43,7 @@ from .widgets.source_list import SourcePanel
 from .widgets.status_bar import StatusBar
 from .tray import TrayIcon
 from .widgets.transitions_panel import TransitionsPanel
-from ..utils import global_hotkeys
+from ..utils import global_hotkeys, logging_setup
 from ..utils.global_hotkeys import GlobalHotkeys
 
 # 底部面板初始宽度，比例参照 OBS 默认布局
@@ -83,6 +83,10 @@ class MainWindow(QMainWindow):
 
         self.store.error_raised.connect(self._show_error)
         self.store.server_info_changed.connect(self._update_title)
+        # 构造时先按当前状态刷一次标题：正常路径下窗口先于连接建立，
+        # 但"已连上再开窗"（如测试、将来可能的多窗口）时也必须是正确的模式标签，
+        # 不能停在默认标题上等下一次 server_info_changed。
+        self._update_title(self.store.server_info)
 
         self._restore_layout()
         if controller.config.auto_connect_on_startup and controller.config.connection.host:
@@ -376,20 +380,91 @@ class MainWindow(QMainWindow):
         dialog = ConnectDialog(self.controller.settings, self.controller.config.connection, self)
         if dialog.exec():
             config: ConnectionConfig = dialog.result_config()
+            # 协议选择与连接信息一起记住：下次连同一台 OBS 不用再选
+            protocol = dialog.protocol_choice()
+            if protocol != getattr(self.controller.config, "protocol", "auto"):
+                self.controller.config.protocol = protocol
+                self.controller.settings.save_config(self.controller.config)
             self.controller.connect(config)
 
     def _open_settings_dialog(self) -> None:
-        dialog = SettingsDialog(self.controller.config, self)
+        dialog = SettingsDialog(
+            self.controller.config,
+            self,
+            store=self.store,
+            theme_name=theme.current_name(),
+            hotkeys={
+                "rows": self._hotkey_rows(),
+                "summary": self._hotkey_summary(),
+                # 「输出 → 录像路径」是只读对照，这里把 OBS 端的实际目录传进去
+                "record_directory": lambda: self.controller.record_directory,
+            },
+            log_dir_opener=self._open_log_dir,
+        )
+        dialog.theme_selected.connect(self._apply_settings_theme)
+        # 「应用」不关窗口，但同样要把改动落到实处
+        dialog.applied.connect(self._apply_settings)
         if dialog.exec():
-            self.controller.apply_config(dialog.result_config())
-            # H6：设置里改了托盘/全局热键，立刻生效
-            if self._tray is not None:
-                self._tray.setVisible(self.controller.config.tray_enabled)
-            self.apply_hotkey_config()
-            # I3：日志级别 / 落盘开关也立即生效
-            from ..app import apply_logging
+            self._apply_settings(dialog.result_config())
 
-            apply_logging(self.controller.config)
+    def _apply_settings(self, config) -> None:
+        """「确定」/「应用」共用：写回配置，并让托盘、热键、日志立刻生效。"""
+        self.controller.apply_config(config)
+        # H6：设置里改了托盘/全局热键，立刻生效
+        if self._tray is not None:
+            self._tray.setVisible(self.controller.config.tray_enabled)
+        self.apply_hotkey_config()
+        # I3：日志级别 / 落盘开关也立即生效
+        from ..app import apply_logging
+
+        apply_logging(self.controller.config)
+        # H10：设置里改了紧凑模式，立刻切换
+        wanted = self.controller.config.compact_mode
+        if wanted != self._compact:
+            self.set_compact_mode(wanted, remember=False)
+
+    def _apply_settings_theme(self, name: str) -> None:
+        """外观页换了主题：立刻套用并记住（与「视图 → 主题」同一条路径）。"""
+        if not name or name == theme.current_name():
+            return
+        from ..app import apply_theme
+
+        apply_theme(QApplication.instance(), name)
+        self.controller.settings.save_theme(name)
+        self._refresh_theme_icons()
+
+    def _open_log_dir(self) -> None:
+        """高级页的「打开日志目录」按钮。"""
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        directory = logging_setup.log_directory()
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+
+    def _hotkey_rows(self) -> list[tuple[str, str]]:
+        """快捷键页要列的表：本客户端真的注册了哪些键。"""
+        labels = {
+            1: "开始 / 停止录制",
+            2: "开始 / 停止直播",
+            3: "切换工作室模式",
+        }
+        rows: list[tuple[str, str]] = []
+        for hotkey_id, sequence in sorted(self.hotkey_bindings().items()):
+            if hotkey_id in labels:
+                name = labels[hotkey_id]
+            elif hotkey_id >= self.QUICK_HOTKEY_BASE:
+                name = f"快捷转场 {hotkey_id - self.QUICK_HOTKEY_BASE}"
+            else:
+                name = f"切换场景 {hotkey_id - 9}"
+            rows.append((name, sequence))
+        return rows
+
+    def _hotkey_summary(self) -> str:
+        return "Ctrl+Alt+R 录制 / +L 直播 / +1~9 场景"
 
     def _toggle_studio_mode(self, checked: bool) -> None:
         self.controller.set_studio_mode(checked)
@@ -604,18 +679,40 @@ class MainWindow(QMainWindow):
 
     def _show_about(self) -> None:
         info = self.store.server_info
+        mode = info.mode_label()
+        if info.protocol == "v4":
+            protocol_note = (
+                "当前连接的 obs-websocket 是 **v4**（OBS ≤ 27），已启用兼容模式。\n"
+                "v4 没有的能力（音频电平表、声道平衡、删除场景、场景排序等）\n"
+                "在界面上已自动隐藏或置灰，不会出现「点了没反应」。"
+            )
+        else:
+            protocol_note = (
+                "当前连接的 obs-websocket 是 v5（标准模式，OBS ≥ 28）。"
+            )
         QMessageBox.information(
             self,
             "关于",
             "OBS Remote Studio\n"
-            "通过 obs-websocket v5 远程控制 OBS Studio。\n\n"
+            "通过 obs-websocket 远程控制 OBS Studio。\n\n"
             f"已连接服务端：{info.label()}\n"
+            f"协议模式：{mode}\n\n"
+            f"{protocol_note}\n\n"
             "订阅事件：Scenes / Outputs / SceneItems / Transitions / Ui\n"
             "界面中置灰的按钮对应 OBS 的编辑类功能，本阶段未接入。",
         )
 
     def _update_title(self, info) -> None:
-        self.setWindowTitle(f"OBS Remote Studio — {info.label()}")
+        """标题里带上协议模式：v5 = 标准模式，v4 = 兼容模式（需求明确要求）。
+
+        拿不到版本信息（未连接）时不硬凑一个模式名，免得显示成"标准模式"误导用户。
+        """
+        if not info or not info.label() or info.label() == "未知版本":
+            self.setWindowTitle("OBS Remote Studio（未连接）")
+            return
+        self.setWindowTitle(
+            f"OBS Remote Studio — {info.label()}（{info.mode_label()}）"
+        )
 
     # ---------------------------------------------------------------- 主题
     def _on_theme_selected(self) -> None:

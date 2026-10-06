@@ -288,6 +288,32 @@ QComboBox QAbstractItemView::item {
     min-height: 18px;
 }
 
+/* 置灰态：输入类控件要一眼看出"不能改"。
+   调色板只管得到文字颜色，背景与边框得在这里补，
+   否则设置面板里被禁用的下拉/输入框看着和可用的一模一样。 */
+QComboBox:disabled, QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {
+    background: @BUTTON_DISABLED@;
+    color: @TEXT_DISABLED@;
+    border-color: @BUTTON_DISABLED_BORDER@;
+}
+QComboBox:disabled::down-arrow {
+    border-top-color: @TEXT_DISABLED@;
+}
+QCheckBox:disabled {
+    color: @TEXT_DISABLED@;
+}
+QCheckBox::indicator:disabled {
+    background: @BUTTON_DISABLED@;
+    border-color: @BUTTON_DISABLED_BORDER@;
+}
+QCheckBox::indicator:checked:disabled {
+    background: @BUTTON_DISABLED_BORDER@;
+    border-color: @BUTTON_DISABLED_BORDER@;
+}
+QLabel#settingsFieldLabel:disabled {
+    color: @TEXT_DISABLED@;
+}
+
 QToolTip {
     background: @SURFACE_ALT@;
     color: @TEXT@;
@@ -361,6 +387,72 @@ QScrollBar:horizontal {
 QScrollBar::handle:horizontal {
     background: @SCROLL_HANDLE@;
     min-width: 20px;
+}
+
+/* ------------------------------------------------------------ 设置对话框 */
+/* 复刻 OBS 原版「设置」窗口：左侧一列带图标的页面，右侧滚动页，
+   页内是「细横线 + 粗体分组标题 + 右对齐标签 + 控件」的排布。 */
+QDialog#settingsDialog {
+    background: @BG@;
+}
+QDialog#settingsBody {
+    background: @BG@;
+}
+
+QListWidget#settingsNav {
+    background: @SURFACE@;
+    border: none;
+    border-right: 1px solid @BORDER@;
+    outline: none;
+    padding: 6px 4px;
+}
+QListWidget#settingsNav::item {
+    padding: 7px 4px;
+    margin: 0;
+    border: none;
+    border-radius: 0;
+    color: @TEXT@;
+}
+QListWidget#settingsNav::item:hover:!selected {
+    background: @SURFACE_HOVER@;
+}
+/* OBS 原版的选中态就是一条纯蓝底、无圆角无描边 */
+QListWidget#settingsNav::item:selected {
+    background: @SELECT@;
+    color: @TEXT_ON_ACCENT@;
+}
+
+QScrollArea#settingsPane {
+    background: @BG@;
+    border: none;
+}
+QScrollArea#settingsPane > QWidget > QWidget {
+    background: @BG@;
+}
+
+/* 分组的细横线：OBS 里就是一条压暗的分隔线 */
+QFrame#settingsRule {
+    color: @BORDER@;
+    max-height: 1px;
+}
+QLabel#settingsSectionTitle {
+    color: @TEXT@;
+    font-weight: bold;
+}
+/* 表单项的标签靠右对齐，与控件之间留一列宽度 */
+QLabel#settingsFieldLabel {
+    color: @TEXT_DIM@;
+}
+QLabel#settingsHint {
+    color: @TEXT_DIM@;
+}
+QWidget#settingsHeader {
+    background: @SURFACE_ALT@;
+    border-bottom: 1px solid @BORDER@;
+}
+QLabel#settingsPageTitle {
+    color: @HEADER_TEXT@;
+    font-weight: bold;
 }
 
 /* ---------------------------------------------------------------- 其它 */

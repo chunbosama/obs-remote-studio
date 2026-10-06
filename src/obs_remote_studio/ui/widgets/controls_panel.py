@@ -102,16 +102,17 @@ class ControlsPanel(DockPanel):
         self.record_btn.setText("停止录制" if record.active else "开始录制")
         self.stream_btn.setText("停止直播" if stream.active else "开始直播")
 
-        # D6：暂停/继续只在录制中有意义；服务端不支持时（老 OBS）置灰并说明原因
+        # D6：暂停/继续只在录制中有意义；服务端不支持时（老 OBS / v4 <4.7）置灰并说明原因
         pause_supported = self.callbacks["pause_supported"]()
         self.pause_btn.setVisible(connected and (record.active or pause_supported))
         self.pause_btn.setEnabled(connected and record.active and pause_supported)
         self.pause_btn.setText("继续录制" if record.paused else "暂停录制")
-        self.pause_btn.setToolTip(
-            "暂停 / 继续录制（需要 OBS 30+ / obs-websocket 5.1+）"
-            if pause_supported
-            else "录制暂停：当前 OBS 版本不支持，按钮暂不可用"
-        )
+        if pause_supported:
+            self.pause_btn.setToolTip("暂停 / 继续录制")
+        else:
+            self.pause_btn.setToolTip(
+                self.store.support_reason(P.REQ_PAUSE_RECORD) or "录制暂停当前不可用"
+            )
 
         # D8：虚拟摄像机。OBS 未装虚拟摄像机驱动时，能力列表里根本没有这几条请求；
         # 也可能是驱动在但资源当前不可用（604），同样收起来。
