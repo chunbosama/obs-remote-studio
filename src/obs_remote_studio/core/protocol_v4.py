@@ -258,6 +258,14 @@ REQUIRES: dict[str, tuple[str, ...]] = {
     "GetCurrentSceneTransition": ("GetCurrentTransition",),
     "SetCurrentSceneTransition": ("SetCurrentTransition",),
     "SetCurrentSceneTransitionDuration": ("SetTransitionDuration",),
+    # P3：v4 **自己也有**场景级转场覆盖（4.8.0 起），但拆成了两条：
+    # 读用 GetSceneTransitionOverride；"清除"要用专门的 RemoveSceneTransitionOverride，
+    # 而不是像 v5 那样传 null。
+    "GetSceneSceneTransitionOverride": ("GetSceneTransitionOverride",),
+    "SetSceneSceneTransitionOverride": (
+        "SetSceneTransitionOverride",
+        "RemoveSceneTransitionOverride",
+    ),
     "SetTBarPosition": ("SetTBarPosition",),
     "GetInputList": ("GetSourcesList",),
     "GetInputVolume": ("GetVolume",),
@@ -283,12 +291,44 @@ REQUIRES: dict[str, tuple[str, ...]] = {
 
 # v4 里没有、但界面需要知道"用不了"的 v5 名字。列出来是为了让界面能给出
 # **具体原因**（而不是笼统的"服务端不支持"）。
+#
+# 与下面 `V4_REQUEST_SINCE` 的区别很重要：
+#   · 这里 = v4 **任何版本都做不到**（协议里压根没有这个请求）；
+#   · 那里 = v4 某个版本起才有，缺了只是"这个 v4 太老"。
+# 两者给用户的下一步动作不同（换 v5 vs 升级 v4 插件），所以不能混为一谈。
 V4_ABSENT_REQUESTS: tuple[str, ...] = (
     "GetInputAudioBalance",
     "SetInputAudioBalance",
     "RemoveScene",
     "SetSceneIndex",
 )
+
+# v4 里"从某个版本起才有"的请求：v5 请求名 -> 引入它的 v4 版本。
+# 用途：兼容模式下置灰时能说"需要 4.8.0 或更高"，而不是错误地说成
+# "v4 没有这项能力" —— 后者会让人以为升级 OBS 才是唯一出路。
+#
+# **版本号逐个从 v4 协议文档的 "Added in" 读出来**（4.9.1 的
+# `docs/generated/protocol.md`），不是凭印象写的。只登记受同一版本门控
+# 的 v5 名字；同一 v5 名字对应多条 v4 请求时取**要求最高的那个版本**
+# （因为 REQUIRES 要求它们全部可用）。
+V4_REQUEST_SINCE: dict[str, str] = {
+    # 场景级转场覆盖（P3）：三条都是 4.8.0
+    "GetSceneSceneTransitionOverride": "4.8.0",
+    "SetSceneSceneTransitionOverride": "4.8.0",
+    # 场景改名：v4 侧是 SetSourceName，4.8.0
+    "SetSceneName": "4.8.0",
+    # 新建场景：v4 侧 CreateScene，4.9.0
+    "CreateScene": "4.9.0",
+    # 下面这些 v4 侧都是 4.9.0
+    "GetMediaInputStatus": "4.9.0",   # GetMediaState/GetMediaDuration/GetMediaTime
+    "TriggerMediaInputAction": "4.9.0",
+    "SetMediaInputCursor": "4.9.0",
+    "OffsetMediaInputCursor": "4.9.0",
+    "SetTBarPosition": "4.9.0",
+    # 音轨：v4 侧 GetTracks/SetTracks 都是 4.9.1
+    "GetInputAudioTracks": "4.9.1",
+    "SetInputAudioTracks": "4.9.1",
+}
 
 
 def synthesize_capabilities(v4_requests) -> set[str]:
@@ -804,6 +844,53 @@ def _resolve_offset_media_cursor(call: CallFn, params: dict) -> None:
 
 
 # ---- 场景集合 / 配置文件（v4 把"列表"和"当前项"拆成两条请求）
+def _resolve_get_scene_transition_override(call: CallFn, params: dict) -> dict:
+    """v4 的场景覆盖转场 -> v5 形状。
+
+    **返回语义差异**（v4 协议文档明确写了）：
+    - v4 没有覆盖时给 `transitionName=""`、`transitionDuration=-1`；
+    - v5 用 **null** 表示"没有覆盖"。
+    所以这里要把这两个哨兵值翻成 None，否则界面上会出现"覆盖转场名叫空串、
+      时长 -1"这种 v5 里不存在的状态。
+    """
+    data = call("GetSceneTransitionOverride", {"sceneName": params.get("sceneName", "")}) or {}
+    name = str(data.get("transitionName", "") or "")
+    duration = data.get("transitionDuration")
+    return {
+        "transitionName": name or None,
+        "transitionDuration": (
+            int(duration) if isinstance(duration, (int, float)) and int(duration) >= 0 else None
+        ),
+    }
+
+
+def _resolve_set_scene_transition_override(call: CallFn, params: dict) -> None:
+    """v5 的"传 null 即清除" -> v4 的"两条请求"。
+
+    **v4 没有 null 语义**：`SetSceneTransitionOverride` 的 `transitionName` 是必填的
+    非可选字符串，清除必须单独调 `RemoveSceneTransitionOverride`。
+    这里的规则是：
+    - `transitionName` 显式为 None（用户选了「无」）→ 调 Remove，把整个覆盖删掉
+      （连时长一起去掉，这正是 OBS 本机「无」的行为）；
+    - 给了名字 → 调 Set；时长只在给了值时带上（v4 该字段可选，
+      省略时服务端会沿用当前 UI 时长）。
+    """
+    scene = str(params.get("sceneName", "") or "")
+    name = params.get("transitionName")
+    duration = params.get("transitionDuration")
+
+    if name is None:
+        # v5 里"名字置 null"就是清除；v4 用 Remove 表达同一件事。
+        # 此时 duration 也一并丢弃 —— 不生效的时长没有保留价值。
+        call("RemoveSceneTransitionOverride", {"sceneName": scene})
+        return
+
+    fields: dict[str, Any] = {"sceneName": scene, "transitionName": str(name)}
+    if isinstance(duration, (int, float)):
+        fields["transitionDuration"] = int(duration)
+    call("SetSceneTransitionOverride", fields)
+
+
 def _resolve_get_scene_collection_list(call: CallFn, params: dict) -> dict:
     listing = call("ListSceneCollections", None) or {}
     current = call("GetCurrentSceneCollection", None) or {}
@@ -886,6 +973,8 @@ RESOLVERS: dict[str, CallFn] = {
     "GetCurrentSceneTransition": _resolve_get_current_transition,
     "SetCurrentSceneTransition": _resolve_set_current_transition,
     "SetCurrentSceneTransitionDuration": _resolve_set_transition_duration,
+    "GetSceneSceneTransitionOverride": _resolve_get_scene_transition_override,
+    "SetSceneSceneTransitionOverride": _resolve_set_scene_transition_override,
     "SetTBarPosition": _resolve_set_tbar_position,
     "GetInputList": _resolve_get_input_list,
     "GetInputVolume": _resolve_get_input_volume,

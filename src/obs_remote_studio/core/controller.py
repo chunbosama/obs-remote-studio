@@ -144,6 +144,11 @@ class Controller(QObject):
         self._items_timer.setSingleShot(True)
         self._items_timer.timeout.connect(self._refresh_scene_items)
 
+        # P3：转场覆盖的回读校准（写完拉一次，以服务端真实状态为准）
+        self._override_timer = QTimer(self)
+        self._override_timer.setSingleShot(True)
+        self._override_timer.timeout.connect(self.refresh_transition_override)
+
         self._audio_timer = QTimer(self)
         self._audio_timer.setSingleShot(True)
         self._audio_timer.timeout.connect(self.refresh_audio)
@@ -198,6 +203,13 @@ class Controller(QObject):
         self._record_directory_asked: bool = False
         # M：切换场景集合/配置文件后要整体作废本地状态
         self._collection_switching: bool = False
+
+        # P3：转场覆盖。`_override_pending_scene` 记住"这次 Get 问的是哪个场景"，
+        # 响应回来时如果用户已经切走了，就丢弃它 —— 否则会把旧场景的覆盖
+        # 显示成新场景的。`_override_intent` 是刚下发的乐观值，
+        # 在回读到达前用它挡住陈旧响应。
+        self._override_pending_scene: str = ""
+        self._override_intent: tuple[str, str | None, int | None, float] | None = None
 
         # E9：批量静音的状态汇总（回执没有 handler，靠这个定时器收尾）
         self._mute_all_timer = QTimer(self)
@@ -512,6 +524,8 @@ class Controller(QObject):
         # G
         self.send_if_supported(P.REQ_GET_STUDIO_MODE_ENABLED)
         self._refresh_transitions()
+        # P3：转场覆盖（必须在场景列表/当前场景就位后再问，否则不知道该问哪个场景）
+        self.refresh_transition_override()
         # E
         self.refresh_audio()
         # D17：录制目录只在第一次刷新时问一次
@@ -1251,6 +1265,86 @@ class Controller(QObject):
             return
         self.send(P.REQ_SET_TRANSITION_DURATION, {"transitionDuration": int(duration_ms)})
 
+    # ---- P3：场景级转场覆盖 ----
+    def transition_override_target(self) -> str:
+        """覆盖作用在**哪个场景**上。
+
+        与来源列表同源（`source_scene`）：演播室模式下是预览场景，否则是节目场景。
+        理由：OBS 的"覆盖转场动画"改的是**即将切过去的那个场景**的属性，
+        而客户端里"我要操作的那个场景"正是场景列表蓝色选中行 —— 也就是 source_scene。
+        两处用同一个定义，用户看到的选择对象和改动的对象才不会错位。
+        """
+        return self.source_scene
+
+    def refresh_transition_override(self) -> None:
+        """拉一次当前目标场景的覆盖。切场景、连接、手动刷新时都会调。"""
+        scene = self.transition_override_target()
+        if not scene:
+            self.store.clear_transition_override()
+            return
+        if not self.store.supports(P.REQ_GET_SCENE_TRANSITION_OVERRIDE):
+            # 服务端没有这条请求：清掉本地值，避免拿别的场景的旧值冒充
+            self.store.clear_transition_override()
+            return
+        # 先把"正在查哪个场景"记下来：响应回来时用它判断是否已过期
+        self._override_pending_scene = scene
+        self.send(P.REQ_GET_SCENE_TRANSITION_OVERRIDE, {"sceneName": scene})
+
+    def set_transition_override(self, name: str | None,
+                                duration_ms: int | None = None) -> None:
+        """设置 / 清除目标场景的转场覆盖。
+
+        `name=None` 表示**清除**（v5 里就是把 transitionName 传 null）——
+        协议语义已核实：null 会删掉该覆盖项、回到全局转场。
+        """
+        scene = self.transition_override_target()
+        if not scene:
+            logger.debug("没有目标场景，忽略转场覆盖设置")
+            return
+        if not self.store.supports(P.REQ_SET_SCENE_TRANSITION_OVERRIDE):
+            self._raise_error_once(
+                self.support_reason(P.REQ_SET_SCENE_TRANSITION_OVERRIDE)
+                or "服务端不支持场景级转场覆盖"
+            )
+            return
+
+        # 时长按服务端边界收敛（超出会被拒，本地先夹住免得白跑一趟）
+        duration = None
+        if duration_ms is not None:
+            duration = max(
+                P.TRANSITION_OVERRIDE_MIN_MS,
+                min(P.TRANSITION_OVERRIDE_MAX_MS, int(duration_ms)),
+            )
+
+        # 乐观更新：先记成本地意图，界面立刻有反馈，随后回读校准
+        self.store.set_transition_override(scene, name, duration)
+        self._override_intent = (scene, name, duration, time.monotonic())
+        # 只设时长、不设转场名是**不会生效**的覆盖（OBS 只在名字存在时才读时长），
+        # 这种情况仍然下发（用户可能就是分两步操作），但要提醒一句。
+        if name is None and duration is not None:
+            logger.info("只设置了覆盖时长而没有转场名，OBS 不会采用该时长")
+        self.send(
+            P.REQ_SET_SCENE_TRANSITION_OVERRIDE,
+            {"sceneName": scene, "transitionName": name, "transitionDuration": duration},
+        )
+        # 回读校准：服务端可能拒绝（名字不存在 → 600），写完后拉一次以真实状态为准
+        self._debounced(self._override_timer)
+
+    def clear_transition_override(self) -> None:
+        """「无」：清除覆盖，回到全局转场。"""
+        self.set_transition_override(None, None)
+
+    def _refresh_override_if_scene_changed(self) -> None:
+        """目标场景变了就重拉覆盖 —— 覆盖是**按场景**存的，不重拉就会串味。
+
+        调用点覆盖了所有"目标场景可能变"的路径：节目场景事件、预览场景事件、
+        演播室模式开关、场景列表回执。判据用 `store.override_scene`（本地已知
+        覆盖属于哪个场景）与当前目标比较，因此重复调用不会重复发请求。
+        """
+        target = self.transition_override_target()
+        if target and target != self.store.override_scene:
+            self.refresh_transition_override()
+
     # ---- G3：演播室模式 ----
     def set_studio_mode(self, enabled: bool) -> None:
         # 乐观更新 + 记意图：连接时在途的 GetStudioModeEnabled 回执可能后到，
@@ -1483,6 +1577,8 @@ class Controller(QObject):
         if preview:
             self.store.set_preview_scene(preview)
         self._refresh_scene_items()
+        # P3：场景列表到位后才知道目标场景是谁，这时才能问它的覆盖
+        self._refresh_override_if_scene_changed()
 
     def _handle_get_video_settings(self, data) -> None:
         numerator = getattr(data, "fps_numerator", 0) or 0
@@ -1676,6 +1772,8 @@ class Controller(QObject):
             return
         self.store.set_current_scene(name)
         self._debounced(self._items_timer)
+        # P3：非演播室模式下目标场景就是节目场景，它变了覆盖要跟着重拉
+        self._refresh_override_if_scene_changed()
 
     def _event_scene_created(self, data) -> None:
         self._debounced(self._refresh_timer)
@@ -1968,12 +2066,61 @@ class Controller(QObject):
             bool(configurable) if configurable is not None else None,
         )
 
+    # ---- P3：场景级转场覆盖 ----
+    def _handle_get_scene_scene_transition_override(self, data) -> None:
+        """把服务端回的真实覆盖写进 store。
+
+        两道过滤，都是"异步错觉"的防线：
+        ① **问的是哪个场景**：响应回来时若用户已经切走，丢弃 —— 否则会把
+           上一个场景的覆盖挂到新场景上；
+        ② **刚下发过的乐观值优先**：用户点了下拉后、回读还没到之前，
+           服务端的旧值可能先到（在途响应），此时不能被它按回去。
+        """
+        scene = self._override_pending_scene
+        current = self.transition_override_target()
+        if not scene or scene != current:
+            logger.debug("丢弃过期的转场覆盖响应：问的是 %s，现在是 %s", scene, current)
+            return
+
+        name = getattr(data, "transition_name", None)
+        duration = getattr(data, "transition_duration", None)
+        name = str(name) if name else None
+        if isinstance(duration, (int, float)) and int(duration) >= 0:
+            duration = int(duration)
+        else:
+            duration = None
+
+        intent = self._override_intent
+        if intent is not None:
+            intent_scene, intent_name, intent_duration, when = intent
+            if time.monotonic() - when > INTENT_WINDOW_S:
+                # 超时不代表"意图还能生效"，只是服务端还没回；这里不作为，
+                # 让下面的真实值落地（宁可显示服务端状态，也不要一直骗自己）
+                self._override_intent = None
+            elif intent_scene != scene:
+                # 目标场景已经换了，这条意图不再适用
+                self._override_intent = None
+            elif (name, duration) == (intent_name, intent_duration):
+                # 服务端已确认这笔写入，意图完成使命，撤掉 ——
+                # 否则它还会在窗口期内挡住后续合法的外部改动
+                self._override_intent = None
+            else:
+                logger.debug(
+                    "保留刚下发的转场覆盖意图（%s/%s），忽略在途的 %s/%s",
+                    intent_name, intent_duration, name, duration,
+                )
+                name, duration = intent_name, intent_duration
+
+        self.store.set_transition_override(scene, name, duration)
+
     def _event_current_preview_scene_changed(self, data) -> None:
         name = str(getattr(data, "scene_name", "") or "")
         if not name:
             return
         self.store.set_preview_scene(name)
         self._debounced(self._items_timer)
+        # P3：演播室模式下目标场景就是预览场景，它变了覆盖要跟着重拉
+        self._refresh_override_if_scene_changed()
 
     def _event_current_scene_transition_changed(self, data) -> None:
         self.store.set_current_transition(str(getattr(data, "transition_name", "") or ""))
@@ -2024,6 +2171,8 @@ class Controller(QObject):
         self.store.set_studio_mode(enabled)
         self._sync_tbar_availability()
         self._debounced(self._items_timer)
+        # P3：开关演播室模式会换掉"目标场景"（预览 ← → 节目），覆盖要重拉
+        self._refresh_override_if_scene_changed()
         if enabled:
             self.send(P.REQ_GET_SCENE_LIST)
 
@@ -2185,6 +2334,11 @@ class Controller(QObject):
             self._raise_error_once("字幕未发出：OBS 当前没有在推流")
             self.send(P.REQ_GET_STREAM_STATUS)
             return
+        if request_type == P.REQ_SET_SCENE_TRANSITION_OVERRIDE:
+            # P3：写入被拒（名字不存在 → 600；OBS ≤ 27 的 v4 老版本没有这条请求 → 204）。
+            # 乐观值必须撤掉并回读真实状态，否则界面会一直显示一个 OBS 根本没接受的覆盖。
+            self._on_override_rejected(code, message)
+            return
         if request_type == P.REQ_TRIGGER_STUDIO_MODE_TRANSITION and (
             code == P.ERR_STUDIO_MODE_NOT_ACTIVE
         ):
@@ -2323,6 +2477,28 @@ class Controller(QObject):
             return f"{studio_hint}，已同步纠正本地状态"
         return f"OBS 拒绝请求（code {code}）：{message}"
 
+    def _on_override_rejected(self, code: int, message: str) -> None:
+        """P3：场景覆盖转场写入被拒 —— 撤掉乐观值并回读真实状态。
+
+        **为什么必须撤**：这条路径是"乐观更新 + 回读校准"，用户一下拉界面就显示新值。
+        如果服务端其实拒绝了（最常见是转场名在 OBS 端不存在 → 600，
+        或 OBS ≤ 27 的 v4 老版本没有这条请求 → 204），不撤的话界面会一直显示
+        一个 OBS 从未接受的覆盖，用户以为设好了、实际切场景时根本不生效。
+        """
+        self._override_intent = None
+        if code == P.ERR_INVALID_REQUEST:
+            # 服务端不认这条请求：能力列表可能不准，按"不支持"记下来并置灰
+            logger.warning("服务端不支持场景覆盖转场：%s", message)
+            self.store.clear_transition_override()
+            return
+        logger.warning("场景覆盖转场被拒（code %d）：%s", code, message)
+        if code == P.ERR_RESOURCE_NOT_FOUND:
+            self._raise_error_once("设置覆盖转场失败：OBS 端没有这个转场")
+        else:
+            self._raise_error_once(f"设置覆盖转场失败：{message}")
+        # 回读一次，让界面回到 OBS 的真实状态（本地乐观值可能已经错了）
+        self.refresh_transition_override()
+
     def _resync_studio_mode(self) -> None:
         """回读工作室模式，让界面与 OBS 真正一致。
 
@@ -2390,6 +2566,8 @@ _REQUEST_LABELS: dict[str, str] = {
     P.REQ_SET_SCENE_INDEX: "调整场景顺序",
     P.REQ_SET_CURRENT_SCENE_TRANSITION: "切换转场",
     P.REQ_SET_TRANSITION_DURATION: "设置转场时长",
+    # P3
+    P.REQ_SET_SCENE_TRANSITION_OVERRIDE: "设置场景覆盖转场",
     P.REQ_TRIGGER_STUDIO_MODE_TRANSITION: "执行转场",
     P.REQ_SET_STUDIO_MODE_ENABLED: "切换工作室模式",
     P.REQ_SET_TBAR_POSITION: "T 型推杆",

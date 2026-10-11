@@ -85,6 +85,12 @@ class V4ObsState:
         self.transitions = ["Cut", "Fade", "Swipe"]
         self.current_transition = "Fade"
         self.transition_duration = 300
+        # P3：场景级转场覆盖（v4 从 4.8.0 起有，但语义与 v5 不同：
+        # "没有覆盖"用 transitionName="" / transitionDuration=-1 表示，
+        # 清除要用单独的 RemoveSceneTransitionOverride）
+        self.transition_overrides: dict[str, dict[str, Any]] = {}
+        self.override_set_calls: list[dict] = []
+        self.override_remove_calls: list[str] = []
         self.studio_mode = False
         self.tbar_position = 0.0
         self.tbar_transitioning = False
@@ -140,6 +146,7 @@ class FakeObsV4Server:
         take_screenshot: bool = True,
         studio_mode: bool = True,
         transition_list: bool = True,
+        transition_override: bool = True,
         scene_item_list: bool = True,
     ) -> None:
         self.host = host
@@ -159,6 +166,9 @@ class FakeObsV4Server:
         self.take_screenshot = take_screenshot
         self.studio_mode = studio_mode
         self.transition_list = transition_list
+        # P3：场景级转场覆盖是 4.8.0 才有的；关掉可模拟更老的 v4，
+        # 用来验证客户端的降级路径（界面置灰而不是"点了没反应"）
+        self.transition_override = transition_override
         # GetSceneItemList 是 4.9.0 才有的；关掉可模拟更老的 v4，
         # 用来验证客户端的降级路径（退回 GetSceneList 并翻转顺序）
         self.scene_item_list = scene_item_list
@@ -427,6 +437,14 @@ class FakeObsV4Server:
                 "SetCurrentTransition",
                 "SetTransitionDuration",
                 "GetTransitionDuration",
+            ]
+        if self.transition_override:
+            # P3：v4 的三条（4.8.0 起）。`REQUIRES` 里把三条都列为前置，
+            # 所以少任何一条客户端都应视为不支持。
+            base += [
+                "GetSceneTransitionOverride",
+                "SetSceneTransitionOverride",
+                "RemoveSceneTransitionOverride",
             ]
         if self.tbar:
             base += ["GetTransitionPosition", "SetTBarPosition", "ReleaseTBar"]
@@ -859,6 +877,43 @@ class FakeObsV4Server:
 
         if req_type == "GetTransitionDuration":
             return {"transition-duration": st.transition_duration}, None, None
+
+        # ---- P3：场景级转场覆盖（v4 语义）----
+        # **与 v5 的关键差异要如实模拟**：v4 用 `transitionName=""`、
+        # `transitionDuration=-1` 表示"没有覆盖"，而不是 null。
+        # 客户端翻译层必须把这两个哨兵值翻成 v5 的 null，否则界面上会出现
+        # "覆盖转场名叫空串、时长 -1"这种 v5 里不存在的状态。
+        if req_type == "GetSceneTransitionOverride":
+            scene = str(fields.get("sceneName", ""))
+            entry = st.transition_overrides.get(scene, {})
+            name = entry.get("transition") or ""
+            duration = entry.get("duration")
+            return {
+                "transitionName": name,
+                "transitionDuration": int(duration) if duration is not None else -1,
+            }, None, None
+
+        if req_type == "SetSceneTransitionOverride":
+            scene = str(fields.get("sceneName", ""))
+            name = str(fields.get("transitionName", "") or "")
+            if name not in st.transitions:
+                return None, None, "requested transition does not exist"
+            st.override_set_calls.append(dict(fields))
+            entry = st.transition_overrides.setdefault(scene, {})
+            entry["transition"] = name
+            # transitionDuration 在 v4 里是可选字段：不给就沿用现有值
+            if "transitionDuration" in fields:
+                value = int(fields["transitionDuration"])
+                if value < 0:
+                    return None, None, "invalid transition duration"
+                entry["duration"] = value
+            return None, None, None
+
+        if req_type == "RemoveSceneTransitionOverride":
+            scene = str(fields.get("sceneName", ""))
+            st.override_remove_calls.append(scene)
+            st.transition_overrides.pop(scene, None)
+            return None, None, None
 
         if req_type == "GetTransitionPosition":
             return {"position": st.tbar_position}, None, None

@@ -131,6 +131,27 @@ REQ_GET_CURRENT_SCENE_TRANSITION = "GetCurrentSceneTransition"
 REQ_SET_CURRENT_SCENE_TRANSITION = "SetCurrentSceneTransition"
 REQ_SET_TRANSITION_DURATION = "SetCurrentSceneTransitionDuration"
 
+# P3：场景级转场覆盖（"这个场景切换时用 XX 转场 / YY 时长"）。
+#
+# **协议语义照服务端 `RequestHandler_Scenes.cpp` 核实过**，两处很关键：
+#   ① `Get` 回来的是 `transitionName` / `transitionDuration`，**没有覆盖时是 null**
+#      （服务端用 `obs_data_get_string` 探到空串就把该字段显式置 null，
+#      时长字段则看 `obs_data_has_user_value` 决定给值还是 null）；
+#   ② `Set` **两个字段都可选、都允许 null**：null 表示"删掉这个覆盖项"。
+#      但服务端要求"至少给一个字段"，两个都不给会回 400 MissingRequestField；
+#      且给了非 null 的 transitionName 时，名字必须真实存在，否则回 600（ResourceNotFound）。
+#      时长范围 50~20000，超出回 400。
+#
+# **还有一个容易做错的地方**：OBS 只在**转场名的覆盖存在时**才去读这个时长
+# （见 `TransitionToScene`：`trOverride` 为空就不会取 `GetOverrideTransitionDuration`）。
+# 所以"只设时长、不设转场名"是一个**不会生效**的覆盖 —— 界面必须讲清楚，
+# 不能让用户以为设了个时长就管用。
+REQ_GET_SCENE_TRANSITION_OVERRIDE = "GetSceneSceneTransitionOverride"
+REQ_SET_SCENE_TRANSITION_OVERRIDE = "SetSceneSceneTransitionOverride"
+# 转场时长的合法范围（服务端 ValidateOptionalNumber 的同一组边界）
+TRANSITION_OVERRIDE_MIN_MS = 50
+TRANSITION_OVERRIDE_MAX_MS = 20_000
+
 # E：音频 / 混音器
 REQ_GET_INPUT_LIST = "GetInputList"
 REQ_GET_INPUT_VOLUME = "GetInputVolume"
@@ -319,6 +340,9 @@ ERR_SUCCESS = 100
 ERR_INVALID_REQUEST = 204  # Your request type is not valid（5.x 里 204 = RequestTypeInvalid）
 ERR_MISSING_PARAMS = 300
 ERR_RESOURCE_NOT_AVAILABLE = 604  # 请求合法，但目标资源当前不可用/未配置
+# 600 ResourceNotFound：资源不存在。P3 用它判断"转场名在 OBS 端不存在"
+# （服务端 SetSceneSceneTransitionOverride 会先按名字找转场，找不到就回 600）。
+ERR_RESOURCE_NOT_FOUND = 600
 # 601/602/603 一类"资源问题"：请求名字对，但对象不存在或当前不可用。
 # 这些都是**运行时的正常业务状态**（例如这台机器没配回放缓冲、没有摄像头），
 # 不该当成"操作失败"弹框打扰用户，只在 debug 日志里留痕即可。

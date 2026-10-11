@@ -105,6 +105,8 @@ class MainWindow(QMainWindow):
             "studio_mode": self.controller.set_studio_mode,
             "transition": self.controller.set_transition,
             "duration": self.controller.set_transition_duration,
+            # P3：场景级转场覆盖（name=None 即清除，回到全局转场）
+            "override": self.controller.set_transition_override,
             "trigger_transition": self.controller.trigger_transition,
             # G4：T 型推杆（position, release）
             "tbar": self.controller.set_tbar_position,

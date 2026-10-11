@@ -1,5 +1,11 @@
 # --- Python ---
 .venv/
+# 重建 .venv 时旧环境先改名保底（.venv.broken-<时间戳>），验证通过后再删；
+# 这是临时保底目录，不入库。
+.venv.broken-*/
+# 独立的测试环境：原 .venv 的基准解释器指向 C:\Users\si\.workbuddy，沙箱下不可用，
+# 于是用 DSH 自带 Python 3.12 另建一个只用于跑测试的环境（不入库）。
+.venv-test/
 venv/
 __pycache__/
 *.py[cod]

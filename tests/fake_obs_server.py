@@ -112,6 +112,13 @@ class FakeObsState:
         ]
         self.current_transition = "Fade"
         self.transition_duration = 300
+        # P3：场景级转场覆盖。key 是场景名，value 是 dict：
+        #   {"transition": str | None, "duration": int | None}
+        # 键不存在 = 该场景没有覆盖（对应协议里的 null）。
+        # **忠实照服务端 RequestHandler_Scenes.cpp**：两个字段各自独立可空，
+        # 时长只在"有用户值"时才回，名字为空串时回 null。
+        self.transition_overrides: dict[str, dict[str, Any]] = {}
+        self.override_set_calls: list[dict] = []
         self.screenshot_count = 0
         # L：媒体源。key 是 inputName，只对 media/ffmpeg/vlc 类源有意义
         self.media: dict[str, dict[str, Any]] = {
@@ -334,6 +341,9 @@ class FakeObsServer:
             "GetCurrentSceneTransition",
             "SetCurrentSceneTransition",
             "SetCurrentSceneTransitionDuration",
+            # P3：场景级转场覆盖（协议 5.0.0 起就有）
+            "GetSceneSceneTransitionOverride",
+            "SetSceneSceneTransitionOverride",
             "GetInputList",
             "GetInputVolume",
             "SetInputVolume",
@@ -815,6 +825,64 @@ class FakeObsServer:
                 "CurrentSceneTransitionDurationChanged",
                 {"transitionDuration": st.transition_duration},
             )
+
+        # ---- P3：场景级转场覆盖 ----
+        # 校验规则照服务端 RequestHandler_Scenes.cpp 一一对应，
+        # 这样"客户端以为设好了、其实被拒"这类问题能在测试里就暴露出来。
+        if req_type == "GetSceneSceneTransitionOverride":
+            scene = str(payload.get("sceneName", ""))
+            if scene not in {s["sceneName"] for s in st.scenes}:
+                return None, ("__error__", (600, f"Scene {scene} does not exist"))
+            entry = st.transition_overrides.get(scene, {})
+            name = entry.get("transition")
+            duration = entry.get("duration")
+            return {
+                # 服务端用显式 null 表示"没有覆盖"
+                "transitionName": name if name else None,
+                "transitionDuration": duration if duration is not None else None,
+            }, None
+        if req_type == "SetSceneSceneTransitionOverride":
+            scene = str(payload.get("sceneName", ""))
+            if scene not in {s["sceneName"] for s in st.scenes}:
+                return None, ("__error__", (600, f"Scene {scene} does not exist"))
+            st.override_set_calls.append(dict(payload))
+            entry = st.transition_overrides.setdefault(scene, {})
+            has_name = "transitionName" in payload
+            has_duration = "transitionDuration" in payload
+            if not has_name and not has_duration:
+                # 服务端：两个都不给 → 400 MissingRequestField
+                return None, (
+                    "__error__",
+                    (
+                        400,
+                        "Your request data must include either `transitionName` "
+                        "or `transitionDuration`.",
+                    ),
+                )
+            name = payload.get("transitionName")
+            duration = payload.get("transitionDuration")
+            if has_name and name is not None:
+                if not any(t.get("transitionName") == name for t in st.transitions):
+                    # 服务端：名字找不到 → 600 ResourceNotFound
+                    return None, (
+                        "__error__",
+                        (600, "No scene transition was found by that name."),
+                    )
+                entry["transition"] = str(name)
+            elif has_name:
+                # 显式 null = 删掉这一项
+                entry.pop("transition", None)
+            if has_duration and duration is not None:
+                value = int(duration)
+                if not (50 <= value <= 20000):
+                    # 服务端：超出范围 → 400
+                    return None, ("__error__", (400, "Parameter: transitionDuration"))
+                entry["duration"] = value
+            elif has_duration:
+                entry.pop("duration", None)
+            if not entry:
+                st.transition_overrides.pop(scene, None)
+            return None, None
 
         # ---- G3：演播室模式 ----
         if req_type == "GetStudioModeEnabled":

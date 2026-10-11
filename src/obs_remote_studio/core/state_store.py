@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal
 
+from .protocol_v4 import V4_REQUEST_SINCE
+
 from .models import (
     AudioInput,
     ConnectionHealth,
@@ -50,6 +52,8 @@ class StateStore(QObject):
     transitions_changed = Signal()
     transition_changed = Signal()
     transitioning_changed = Signal()
+    # P3：场景级转场覆盖（"这个场景切换时用 XX 转场 / YY 时长"）
+    transition_override_changed = Signal()
 
     # F2：缩略图（role: program / preview）
     frame_ready = Signal(str, bytes)
@@ -105,6 +109,13 @@ class StateStore(QObject):
         self.transition_duration_ms: int = 300
         self.transition_configurable: bool = True
         self.transitioning: bool = False
+        # P3：场景级转场覆盖。存的是**当前查看的那个场景**的覆盖，
+        # 以及它属于哪个场景 —— 两者必须一起变，否则会出现
+        # "场景已经切过去了、覆盖值还是上一个场景的"这种错配。
+        # None = 该字段没有覆盖（协议里就是 null）。
+        self.override_scene: str = ""
+        self.override_transition: str | None = None
+        self.override_duration_ms: int | None = None
         self.supported_requests: set[str] = set()
         self.rejected_requests: set[str] = set()  # 服务端明确回过 204 的请求
         # obs-websocket v4 兼容模式（OBS ≤ 27）。单独的布尔量是给"能力列表本身
@@ -357,6 +368,46 @@ class StateStore(QObject):
         self.transitioning = value
         self.transitioning_changed.emit()
 
+    # ---- P3：场景级转场覆盖 ----
+    def set_transition_override(self, scene: str, name: str | None,
+                               duration_ms: int | None = None) -> None:
+        """设置"当前查看场景"的转场覆盖。
+
+        `scene` 必须一起传：覆盖是**按场景**存的，只写值不写场景名，
+        切场景时就会把上一个场景的覆盖当成新场景的（界面会显示错的值）。
+        """
+        key = str(scene or "")
+        changed = (
+            key != self.override_scene
+            or (name or None) != self.override_transition
+            or duration_ms != self.override_duration_ms
+        )
+        self.override_scene = key
+        self.override_transition = name or None
+        self.override_duration_ms = duration_ms
+        if changed:
+            self.transition_override_changed.emit()
+
+    def clear_transition_override(self) -> None:
+        """离开场景 / 断开时清掉，避免旧值冒充新场景的覆盖。"""
+        if not self.override_scene and self.override_transition is None \
+                and self.override_duration_ms is None:
+            return
+        self.override_scene = ""
+        self.override_transition = None
+        self.override_duration_ms = None
+        self.transition_override_changed.emit()
+
+    def override_for(self, scene: str) -> tuple[str | None, int | None] | None:
+        """取某个场景的已知覆盖；**没有这个场景的数据时回 None**（不是"无覆盖"）。
+
+        这个区分很重要：`(None, None)` 表示"确认没有覆盖（回到全局）"，
+        而 `None` 表示"还没查到"。界面据此决定是否显示"读取中"。
+        """
+        if not scene or scene != self.override_scene:
+            return None
+        return (self.override_transition, self.override_duration_ms)
+
     # ---- E：音频 ----
     def set_audio_inputs(self, inputs: list[AudioInput]) -> None:
         self.audio_inputs = inputs
@@ -442,14 +493,24 @@ class StateStore(QObject):
         """某个请求**为什么用不了**（能用则回空串），给界面置灰说明用。
 
         本项目的老规矩：置灰必须写清原因，否则用户只会以为功能坏了。
-        兼容模式下原因与 v5 不同 —— 不是"OBS 版本太老"，而是
-        "obs-websocket v4 协议里根本没有这条请求"，措辞要分开。
+
+        **兼容模式下的措辞不能一律写成"v4 没有这项能力"**：v4 里有些请求是
+        **按版本陆续补齐**的（例如场景级转场覆盖是 **4.8.0** 起、音轨是 4.9.1 起、
+        推杆是 4.9.0 起），此时正确的原因是"**这个 v4 版本**还太老"，
+        而不是"v4 协议根本没有它"。两者给用户的下一步动作完全不同：
+        前者可以升级 v4 插件，后者只能升级到 OBS ≥ 28。
         """
         if self.supports(request_type) and not self.is_unavailable(request_type):
             return ""
         if self.is_unavailable(request_type):
             return self.unavailable_reason(request_type) or "OBS 当前不接受该请求"
         if self.compat_mode:
+            since = V4_REQUEST_SINCE.get(request_type)
+            if since:
+                return (
+                    f"obs-websocket v4 需要 {since} 或更高版本才有这项能力，"
+                    "请升级 v4 插件或改用 OBS ≥ 28"
+                )
             return "obs-websocket v4（兼容模式）没有这项能力，请在 OBS 端操作或升级 OBS ≥ 28"
         return "当前 OBS 版本不支持该请求"
 
@@ -472,6 +533,10 @@ class StateStore(QObject):
         self.preview_scene = ""
         self.transitions = []
         self.transitioning = False
+        # P3：断开后覆盖值必须清掉，否则下次连上会拿旧覆盖冒充新场景的
+        self.override_scene = ""
+        self.override_transition = None
+        self.override_duration_ms = None
         self.rejected_requests.clear()
         self.unavailable_requests.clear()
         self.audio_inputs = []
@@ -495,6 +560,7 @@ class StateStore(QObject):
         self.video_changed.emit()
         self.studio_changed.emit()
         self.transitions_changed.emit()
+        self.transition_override_changed.emit()
         self.replay_buffer_changed.emit()
         self.virtualcam_changed.emit()
         self.health_changed.emit()
