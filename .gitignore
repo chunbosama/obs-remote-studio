@@ -34,6 +34,12 @@ logs/
 *.tmp
 .tmp*/
 
+# 测试用 tempfile.mkdtemp() 建的临时目录（obsrs-smoke-xxx / obsrs-pair-xxx /
+# tmpXXXX）。正常情况下它们落在 %TEMP%，但某些环境（沙箱里 TMP 指向工作目录）
+# 会直接建在仓库根，不加这条就会一直出现在 git status 里。
+/obsrs-*/
+/tmp*/
+
 # --- 编辑器 / 系统 ---
 .idea/
 *.swp

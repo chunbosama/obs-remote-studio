@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "obs-remote-studio"
 version = "0.1.0"
-description = "OBS Studio 远程控制客户端（基于 obs-websocket v5 / PySide6）"
+description = "OBS Studio 远程控制客户端（obs-websocket v5 标准模式 / v4 兼容模式，PySide6）"
 requires-python = ">=3.10"
 dependencies = [
     "PySide6>=6.5",
@@ -16,6 +16,9 @@ dependencies = [
 dev = [
     "websockets>=12.0",   # 仅用于测试中的假 OBS 服务器
     "pytest>=8.0",
+]
+build = [
+    "pyinstaller>=6.0",   # 打 exe（scripts/packaging/build.py，见 README「打包成 exe」）
 ]
 
 [project.scripts]

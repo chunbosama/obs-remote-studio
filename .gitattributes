@@ -1,0 +1,25 @@
+# 行尾统一：仓库内一律存 LF，检出时由各人 core.autocrlf 决定。
+# 当前工作区的 .py/.md 是 CRLF、.toml/.bat 是 LF，声明 text=auto 后
+# 两种情况都会被正确归一化，不会出现"整文件改动"的假 diff。
+* text=auto
+
+# 二进制资源：禁止任何行尾转换与文本 diff
+*.png  binary
+*.ico  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.exe  binary
+*.dll  binary
+*.pyd  binary
+*.so   binary
+*.zip  binary
+*.ttf  binary
+*.otf  binary
+
+# 这些文件在 Windows 上按 CRLF 更稳妥（cmd.exe / PowerShell 习惯）
+# 注意：.bat 已按项目约定只写 ASCII，别加中文进去（见 MEMORY.md）。
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf

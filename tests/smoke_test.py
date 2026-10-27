@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from PySide6.QtCore import QSettings  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from fake_obs_server import DEFAULT_PASSWORD, FakeObsServer  # noqa: E402
+from fake_obs_server import DEFAULT_PASSWORD, FakeObsServer, make_png, screenshot_shade  # noqa: E402
 
 from obs_remote_studio.core import protocol as P  # noqa: E402
 from obs_remote_studio.core.controller import Controller  # noqa: E402
@@ -704,6 +704,25 @@ def main() -> int:
     check("节目未被动到", active.state.current_scene == "主画面", active.state.current_scene)
     wait_until(lambda: "preview" in frames, 8, app)
     check("预览窗也出画面", bool(frames.get("preview")))
+
+    # 回归：**预览窗必须是预览场景的画面、输出窗必须是输出场景的画面**。
+    # 假服务器的截图灰度跟着场景名走（fake_obs_server.screenshot_shade），
+    # 于是"两块画面搞反"在字节比对上一目了然 —— 用户报的正是这个：
+    # 点场景后输出窗切到了预览场景、预览窗不动。
+    # 注意这里只能查"最终归属对不对"，抓不到"超时后错位一格"的瞬时态，
+    # 那一条由 preview_pairing_test.py 的 [A] 段逼出来。
+    want_preview = make_png(shade=screenshot_shade(controller.store.preview_scene))
+    want_program = make_png(shade=screenshot_shade(controller.store.current_scene))
+    settled = wait_until(
+        lambda: frames.get("preview") == want_preview and frames.get("program") == want_program,
+        8,
+        app,
+    )
+    check(
+        "预览窗/输出窗各自显示自己场景的画面（角色没搞反）",
+        settled,
+        f"preview={frames.get('preview', b'')[:8]!r} 期望 {want_preview[:8]!r}",
+    )
     wait_until(
         lambda: any(i.source_name == "结束画面" for i in controller.store.scene_items), 8, app
     )

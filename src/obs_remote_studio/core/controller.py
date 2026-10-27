@@ -67,6 +67,11 @@ EVENT_RETRY_MAX_ATTEMPTS = 4
 # G4：推杆"推到底松手"之后，等多久还没任何转场动静就判定 OBS 没理会这次推杆
 TBAR_NO_EFFECT_CHECK_MS = 3000
 
+# F2：一条缩略图请求最多等多久。超过就认为这一拍彻底没了下文（连接卡住 /
+# 响应被丢掉），把整条缩略图流水线作废重来 —— 否则那一格会永久占着队列，
+# 对应那块画面再也不刷新（"预览窗一直不动"）。
+FRAME_STALE_SECONDS = 3.0
+
 # E9：批量静音的收尾等待窗口。
 # 用"时间窗口"而不是"计数到零"来界定这一批：`request_failed` 只带
 # requestType、**不带 inputName**，靠计数递减无法区分"批量里的失败"与
@@ -188,7 +193,9 @@ class Controller(QObject):
         self._frame_timer.setInterval(self.config.preview_interval_ms)
         self._frame_timer.timeout.connect(self._on_frame_tick)
         self._frame_queue: deque[str] = deque()
-        self._frame_pending: set[str] = set()
+        # 在途的角色 -> 发出请求的时刻（monotonic）。用时间戳而不是 set：
+        # 卡住的那一拍要靠它判超时（见 _expire_stale_frames）。
+        self._frame_pending: dict[str, float] = {}
 
         # A11：连接健康心跳。空闲时发一次 GetVersion，用它量 RTT。
         # 刻意**不用** GetStats：那一拍本来就够重，再叠心跳会互相干扰计时。
@@ -1942,8 +1949,19 @@ class Controller(QObject):
 
     # ---- F2：缩略图 ----
     def _handle_get_source_screenshot(self, data) -> None:
-        role = self._frame_queue.popleft() if self._frame_queue else "program"
-        self._frame_pending.discard(role)
+        """一张缩略图回来了，按"在途队列"给它贴上角色（preview / program）。
+
+        **角色只能来自队列，不能猜。** 这里原来在队列为空时默认当 `program`：
+        一旦某条响应对不上号（例如超时后迟到的响应被下一条请求认领），
+        预览画面就会被画到输出窗上，而且从此每帧都错一格 ——
+        现场表现正是"点场景后输出窗切到了预览场景、预览窗不动"。
+        对不上的帧宁可丢掉：丢一帧只是晚一拍出图，贴错角色是一直错下去。
+        """
+        if not self._frame_queue:
+            logger.debug("收到没有对应请求的缩略图，已丢弃（无法判定它属于预览还是输出）")
+            return
+        role = self._frame_queue.popleft()
+        self._frame_pending.pop(role, None)
         image_data = getattr(data, "image_data", "") or ""
         payload = image_data.split(",", 1)[-1] if "," in image_data else image_data
         if not payload:
@@ -1953,10 +1971,36 @@ class Controller(QObject):
         except Exception:  # noqa: BLE001
             logger.debug("缩略图解码失败", exc_info=True)
 
+    def _expire_stale_frames(self, now: float) -> None:
+        """整条缩略图流水线卡住时整体作废，别让某块画面永久冻住。
+
+        正常情况下每条请求都会有结果：要么回图（`_handle_get_source_screenshot`），
+        要么被服务端拒/超时（`_on_request_failed`），队列和"在途"标记都会推进。
+        但只要哪一环彻底没了下文，那一格就会永久占着位 —— 该角色再也不会发请求
+        （画面冻住），队列里的占位还会让之后每一帧都错位一格。
+        所以这里按"最老的在途请求"卡一个上限，超了就整条清空重来：
+        清空是安全的，因为清空之后对不上的帧会被 `_handle_get_source_screenshot` 丢掉。
+        """
+        if not self._frame_pending:
+            return
+        interval = max(self._frame_timer.interval(), 1) / 1000.0
+        deadline = max(FRAME_STALE_SECONDS, interval * 3)
+        if now - max(self._frame_pending.values()) <= deadline:
+            return
+        logger.warning(
+            "缩略图流水线超过 %.1fs 没有下文，整体作废重来（在途：%s）",
+            deadline,
+            "、".join(sorted(self._frame_pending)),
+        )
+        self._frame_queue.clear()
+        self._frame_pending.clear()
+
     @Slot()
     def _on_frame_tick(self) -> None:
         if self.store.connection_state != CONNECTED:
             return
+        now = time.monotonic()
+        self._expire_stale_frames(now)
         roles = ["preview", "program"] if self.store.studio_mode else ["program"]
         for role in roles:
             if role in self._frame_pending:
@@ -1966,7 +2010,7 @@ class Controller(QObject):
             )
             if not scene:
                 continue
-            self._frame_pending.add(role)
+            self._frame_pending[role] = now
             self._frame_queue.append(role)
             payload: dict[str, object] = {
                 "sourceName": scene,
@@ -2296,7 +2340,7 @@ class Controller(QObject):
             # 缩略图 1fps 地失败会刷屏，静默丢弃并放回配额
             role = self._frame_queue.popleft() if self._frame_queue else None
             if role:
-                self._frame_pending.discard(role)
+                self._frame_pending.pop(role, None)
             logger.debug("获取缩略图失败：%s", message)
             return
         if request_type in _AUDIO_GET_REQUESTS:

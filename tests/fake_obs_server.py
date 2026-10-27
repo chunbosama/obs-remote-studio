@@ -49,6 +49,15 @@ def expected_auth(password: str, salt: str, challenge: str) -> str:
     ).decode()
 
 
+def screenshot_shade(scene: str) -> int:
+    """某个场景的截图灰度：**同一个场景固定、不同场景必然不同**。
+
+    测试靠它判断"这块画面是谁的"——缩略图搞反（预览窗显示输出场景）
+    在纯字节比较上很容易蒙对，必须能一眼看出颜色对不上。
+    """
+    return 0x20 + (zlib.crc32(scene.encode("utf-8")) % 0xC0)
+
+
 def make_png(width: int = 480, height: int = 270, shade: int = 0x40) -> bytes:
     """生成一张合法的小 PNG（测试里当缩略图用，避免依赖 Pillow）。"""
 
@@ -185,6 +194,7 @@ class FakeObsServer:
         tbar: bool = True,
         tbar_silent: bool = False,
         obs_version: str = "",
+        slow_responses: dict[str, float] | None = None,
     ):
         """legacy_transitions=True：模拟 obs-websocket 5.0，只认 GetTransitionList。
         hide_available_requests=True：GetVersion 不上报 availableRequests，
@@ -195,6 +205,10 @@ class FakeObsServer:
         unavailable_requests：请求名**在** availableRequests 里（所以客户端会发），
         但服务端回 604 ResourceNotAvailable —— 对应"有这台机器没配回放缓冲"的真实场景，
         用来验证 604 不会弹错误框。
+        slow_responses：{请求名: 秒数}，**下一次**这条请求的响应帧延迟这么久才发
+        （状态改动照常立即生效）。用来复现"响应比客户端超时还慢"——
+        客户端放弃之后那条响应会落到 socket 里，被下一条请求认领，
+        正是"预览/输出画面永久对调"的起点。
         """
         self.host = host
         self.port = port
@@ -216,6 +230,8 @@ class FakeObsServer:
         # 上报的 OBS 版本（"" = 用默认值）。T 型推杆的显隐跟版本有关，
         # 所以测试要能在 29.0.2 与 31.x 之间切换。
         self.obs_version = obs_version
+        # {请求名: 秒数}：下一次这条请求的响应延迟多久才发（一次性）
+        self.slow_responses: dict[str, float] = dict(slow_responses or {})
         self.state = FakeObsState()
         self.requests: list[str] = []
 
@@ -504,6 +520,7 @@ class FakeObsServer:
             )
             return
         events = [] if event is None else ([event] if isinstance(event, tuple) else list(event))
+        await self._delay_response(req_type)
         await ws.send(
             json.dumps(
                 {
@@ -519,6 +536,16 @@ class FakeObsServer:
         )
         for item in events:
             await self.broadcast(*item)
+
+    async def _delay_response(self, req_type: str) -> None:
+        """按 `slow_responses` 把这一次响应帧压后发。
+
+        只在**成功路径**上延迟：状态改动已经生效，晚的只是那一帧响应 ——
+        这正是真实 OBS 慢一拍时的样子（客户端放弃后那条响应仍在 socket 里）。
+        """
+        delay = self.slow_responses.pop(req_type, 0.0)
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     def _dispatch(self, req_type: str, payload: dict) -> tuple[dict | None, tuple[str, dict] | None]:
         st = self.state
@@ -784,7 +811,14 @@ class FakeObsServer:
         # ---- F2：缩略图 ----
         if req_type == "GetSourceScreenshot":
             st.screenshot_count += 1
-            shade = 0x30 + (st.screenshot_count * 7) % 0x60
+            scene = str(payload.get("sourceName", "") or "")
+            # 灰度跟着**场景**走（不是跟着调用次数走）：这样客户端一旦把
+            # 预览/输出两块画面接反，测试能直接从颜色上看出来。
+            shade = (
+                screenshot_shade(scene)
+                if scene
+                else 0x30 + (st.screenshot_count * 7) % 0x60
+            )
             # 尺寸贴近真实截图（OBS 端按请求的 imageWidth 出图），
             # 太小的图会让客户端的"缩放百分比"看起来离谱
             encoded = base64.b64encode(make_png(shade=shade)).decode()

@@ -18,7 +18,7 @@ import json
 import logging
 
 from PySide6.QtCore import QObject, Signal, Slot
-from obsws_python import EventClient, ReqClient
+from obsws_python import EventClient
 from obsws_python.error import OBSSDKError, OBSSDKRequestError, OBSSDKTimeoutError
 from websocket import (
     WebSocketConnectionClosedException,
@@ -29,6 +29,7 @@ from websocket import (
 from . import protocol as P
 from . import protocol_v4 as V4
 from .client_v4 import V4EventClient, V4ReqClient, detect_protocol
+from .client_v5 import VerifiedReqClient
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ class ObsWorker(QObject):
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
-        self._req: ReqClient | None = None
+        self._req: VerifiedReqClient | V4ReqClient | None = None
         self._events: EventClient | None = None
         self._timeout: float = 3.0
         self._subscriptions: int = P.SUBSCRIPTION_MASK
@@ -151,13 +152,19 @@ class ObsWorker(QObject):
             else:
                 # 请求连接必须 subs=0：一旦订阅事件，事件帧会混进请求/响应流，
                 # obsws-python 的 req() 会把事件当成响应解析。事件一律走 EventClient。
-                self._req = ReqClient(
+                #
+                # 用 **VerifiedReqClient** 而不是 obsws-python 自带的 ReqClient：
+                # 自带的 req() 收响应时不看 requestId，只要有一条请求超时，
+                # 迟到的响应就会被下一条请求认领，之后每条响应都错位一格且不可自愈
+                # （现场后果：预览/输出两块画面永久对调）。见 core/client_v5.py。
+                self._req = VerifiedReqClient(
                     host=host,
                     port=port,
                     password=password,
                     subs=0,
                     timeout=self._timeout,
                 )
+                self._req.on_stale = self._on_stale_frame
         except OBSSDKError as exc:
             self.connect_failed.emit(self._classify(exc, password), str(exc))
             return
@@ -312,6 +319,25 @@ class ObsWorker(QObject):
             return
         self.raw_trace.emit("<-", "response", {"requestType": request_type, "response": _to_plain(response)})
         self.result_ready.emit(request_type, response)
+
+    def _on_stale_frame(self, data: dict) -> None:
+        """有一条迟到的响应被丢弃（`VerifiedObsClient.on_stale` 回调）。
+
+        这件事必须进诊断流：它是"响应集体错位一格"的成因，
+        而错位一格在界面上表现为缩略图预览/输出对调、操作看着没生效。
+        排障时如果只看到"请求发了、后面什么都没有"，很容易误判成 OBS 没回。
+        """
+        self.raw_trace.emit(
+            "<-",
+            "error",
+            {
+                "requestType": data.get("requestType", "?"),
+                "requestId": data.get("requestId", "?"),
+                "stale": True,
+                "dropped": True,
+                "reason": "迟到的响应（已超时的请求），若被下一条请求认领会让整条连接的响应错位一格",
+            },
+        )
 
     def _trace_dropped(self, request_type: str, reason: str) -> None:
         """记一条"结果被丢弃"的帧。
