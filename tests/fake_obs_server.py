@@ -1189,6 +1189,43 @@ class FakeObsServer:
             self.broadcast(event_type, event_data), self._loop
         ).result(3)
 
+    # ---------------------------------------------------------------- 故障注入
+    def kill_event_clients(self) -> int:
+        """**只**掐掉订阅了事件的连接，控制连接原样保留；返回掐掉几条。
+
+        用来复现"事件通道断了、请求通道还活着"这种真实场景（OBS 重启时
+        先关事件连接、中间网络抖动、代理/防火墙只挂掉长连接）。
+        两条连接**必须能分开掐** —— 否则无法证明客户端是靠"事件监听线程
+        退出了"发现的，而不是靠"请求也失败了"顺带发现的。
+
+        统计与关闭都放进 loop 线程里做：`self._subs` 由 loop 线程维护，
+        在别的线程里遍历它可能撞上 "dictionary changed size during iteration"。
+        """
+        return asyncio.run_coroutine_threadsafe(
+            self._kill_event_clients(), self._loop
+        ).result(5)
+
+    async def _kill_event_clients(self) -> int:
+        targets = [ws for ws, subs in self._subs.items() if subs]
+        for ws in targets:
+            transport = getattr(ws, "transport", None)
+            if transport is not None:
+                # 直接断 TCP：客户端 recv 立刻抛 OSError，
+                # 与"网线断了"同一种失败（而不是走正常的关闭握手）。
+                transport.abort()
+            else:
+                await ws.close()
+        return len(targets)
+
+    def event_client_count(self) -> int:
+        """当前还有几条订阅了事件的连接（0 = 事件通道已全断）。"""
+        return asyncio.run_coroutine_threadsafe(
+            self._count_event_clients(), self._loop
+        ).result(5)
+
+    async def _count_event_clients(self) -> int:
+        return sum(1 for subs in self._subs.values() if subs)
+
 
 if __name__ == "__main__":
     server = FakeObsServer()

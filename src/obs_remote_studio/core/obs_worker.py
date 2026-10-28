@@ -86,6 +86,10 @@ class ObsWorker(QObject):
     request_connect = Signal(dict)
     request_disconnect = Signal()
     request_execute = Signal(str, dict)
+    # 让 worker **在自己的线程里**看一眼事件通道还活着没。
+    # 死了就按"建连失败"上报，交给 controller 那套退避重建接手
+    # （见 _on_event_link_check 里为什么必须专门查）。
+    request_event_link_check = Signal()
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -104,6 +108,7 @@ class ObsWorker(QObject):
         self.request_connect.connect(self._on_connect)
         self.request_disconnect.connect(self._on_disconnect)
         self.request_execute.connect(self._on_execute)
+        self.request_event_link_check.connect(self._on_event_link_check)
         # 事件通道重建必须接上：controller 在事件通道建失败后会带退避 emit 这个信号
         # （见 controller._schedule_event_retry）。此前**漏了这一行连接**，
         # 于是整条重试链路是死的 —— 事件通道一旦建不上就再也收不到事件，
@@ -202,6 +207,10 @@ class ObsWorker(QObject):
         self._start_event_client(host, port, password)
 
     def _start_event_client(self, host: str, port: int, password: str) -> None:
+        # 重建前先把旧的收掉：重试链路与"发现断开"是两条路径，都可能走到这里，
+        # 留着旧对象会多出一条仍在推事件的连接（同一事件收两遍），
+        # 也会让 `_on_event_link_check` 查到一条早就该扔掉的监听线程。
+        self._drop_event_link()
         try:
             if self._protocol == V4.MODE_COMPAT:
                 self._events = V4EventClient(
@@ -252,11 +261,34 @@ class ObsWorker(QObject):
         target = getattr(self, "_event_target", None)
         if not target:
             return
-        try:
-            self._events = None
-        except Exception:  # noqa: BLE001
-            pass
         self._start_event_client(*target)
+
+    @Slot()
+    def _on_event_link_check(self) -> None:
+        """事件通道**建好之后**还活着吗？
+
+        为什么必须专门查：`obsws-python` 的 `EventClient` 在自己的线程里
+        `recv`，连接一断它只把 `stop_event` 一置就**静默退出**
+        （`obsws_python/events.py`：`except (WebSocketConnectionClosedException, OSError)`
+        → `stop_event.set()`），既不回调也不抛。于是控制通道还在、
+        `connection_state` 仍是 CONNECTED、界面一切正常，但场景切换 / 录制状态 /
+        媒体播放这些**全靠事件**的显示项从此不再更新 —— 而"建连失败"那条
+        退避重建链路永远进不去（它只挂在 `_start_event_client` 的异常分支上）。
+
+        判据选"监听线程还在不在"而不是"多久没收到事件"：后者在低事件量场景
+        （切一次场景后十分钟没动静）会误判，前者是确定事实。
+        查不出结论时（库换了线程属性）宁可不下结论，也不要误报一次重建。
+        """
+        if self._req is None or self._events is None:
+            return  # 没有控制通道 / 本来就没有事件通道：不归这里管
+        thread = getattr(self._events, "worker", None)
+        if thread is None:
+            return  # 拿不到监听线程：不敢下结论，交给真正的失败暴露问题
+        if thread.is_alive():
+            return
+        logger.warning("事件通道已断开（监听线程已退出），按建连失败处理，交给上层重建")
+        self._drop_event_link()
+        self.event_link_failed.emit("事件连接已断开（OBS 侧关闭连接或网络中断）")
 
     def _make_callback(self, event_type: str, callback_name: str):
         def handler(data, _type=event_type):
@@ -394,6 +426,30 @@ class ObsWorker(QObject):
         self.request_failed.emit(request_type, str(exc) or "连接已中断", True, 0)
 
     # ---------------------------------------------------------------- 内部
+    def _drop_event_link(self) -> None:
+        """丢掉事件连接：先摘引用，再尽力关掉 socket。
+
+        监听线程**还活着**时刻意不走 `disconnect()`：v5 的
+        `EventClient.disconnect()` 末尾是 `worker.join()`，而那个 join **没有超时**,
+        一旦线程卡在 recv，这里就会把 worker 线程一起拖死（退出时表现为
+        `shutdown()` 的 wait 超时、QThread 带着运行态销毁）。
+        这种情况只关 socket：recv 立刻抛错，线程自己退出去。
+        """
+        link, self._events = self._events, None
+        if link is None:
+            return
+        try:
+            thread = getattr(link, "worker", None)
+            if thread is not None and thread.is_alive():
+                # v5 的 ws 挂在 base_client 上，v4 的就在自己身上
+                socket_ws = getattr(getattr(link, "base_client", link), "ws", None)
+                if socket_ws is not None:
+                    socket_ws.close()
+                return
+            link.disconnect()
+        except Exception:  # noqa: BLE001
+            logger.debug("关闭事件连接时出错", exc_info=True)
+
     def _safe_close(self) -> None:
         for client in (self._req, self._events):
             if client is None:

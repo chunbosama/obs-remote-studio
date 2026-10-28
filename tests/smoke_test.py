@@ -29,7 +29,7 @@ from fake_obs_server import DEFAULT_PASSWORD, FakeObsServer, make_png, screensho
 
 from obs_remote_studio.core import protocol as P  # noqa: E402
 from obs_remote_studio.core.controller import Controller  # noqa: E402
-from obs_remote_studio.core.models import ConnectionConfig  # noqa: E402
+from obs_remote_studio.core.models import ConnectionConfig, ConnectionHealth  # noqa: E402
 from obs_remote_studio.core.state_store import (  # noqa: E402
     CONNECTED,
     RECONNECTING,
@@ -1162,6 +1162,81 @@ def main() -> int:
     wait_until(lambda: controller.store.connection_state != CONNECTED, 5, app)
     server_ev.stop()
 
+    print("\n[12f-3] 事件通道建好之后再断开，必须被发现并重建（回归 H1）")
+    # 病因：obsws-python 的 EventClient 在自己的线程里 recv，连接一断它只把
+    # stop_event 一置就**静默退出**（events.py 的
+    # `except (WebSocketConnectionClosedException, OSError) → stop_event.set()`），
+    # 不回调也不抛。于是控制通道还在、connection_state 仍是 CONNECTED、界面一切正常，
+    # 但场景/录制/媒体这些全靠事件的显示项从此不再更新 —— 而"建连失败"那条
+    # 退避重建链路只挂在 _start_event_client 的异常分支上，永远进不去。
+    port_h1 = free_port()
+    server_h1 = FakeObsServer(host="127.0.0.1", port=port_h1)
+    server_h1.start()
+    controller.config.connection = ConnectionConfig(
+        host="127.0.0.1", port=port_h1, password=DEFAULT_PASSWORD
+    )
+    controller.connect()
+    connected_h1 = wait_until(
+        lambda: controller.store.connection_state == CONNECTED, 15, app
+    )
+    check("（H1）已连上", connected_h1, controller.store.status_message)
+
+    def _scene_event_arrives(expected: str, timeout: float = 8.0) -> bool:
+        """反复广播同一条事件，直到本地跟上。
+
+        事件通道是**连接之后**才建的（worker 先发 connected、再 _start_event_client），
+        所以"已连接"不等于"已订阅"。抢在订阅之前广播，服务端会当成没有订阅者
+        直接丢掉（真实 OBS 也一样）—— 这正是第一版用例偶发红的原因。
+        反复播几次最省事：一旦订阅上，下一发就到。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            server_h1.broadcast_threadsafe(
+                "CurrentProgramSceneChanged", {"sceneName": expected}
+            )
+            app.processEvents()
+            if controller.store.current_scene == expected:
+                return True
+            time.sleep(0.05)
+        return controller.store.current_scene == expected
+
+    # 先证事件通道确实在工作
+    check("（H1）事件通道正常时事件能到达", _scene_event_arrives("结束"),
+          controller.store.current_scene)
+    check("（H1）事件通道监听线程活着", controller.worker._events is not None
+          and controller.worker._events.worker.is_alive())
+    # 反面控制：健康状态下不许误报（跑几拍轮询，自检会每秒被调用一次）
+    for _ in range(10):
+        app.processEvents()
+        time.sleep(0.05)
+    check("（H1）健康时不自检失败、不排重建",
+          not controller._event_retry_timer.isActive(),
+          f"active={controller._event_retry_timer.isActive()}")
+
+    errors.clear()
+    # 只掐事件连接，控制连接原样保留 —— 证明客户端不是靠"请求也失败了"顺带发现的
+    killed = server_h1.kill_event_clients()
+    check("（H1）假服务器只掐掉事件连接", killed == 1, f"killed={killed}")
+    check("（H1）控制连接此刻仍然连着（关键前提）",
+          wait_until(lambda: server_h1.event_client_count() == 0, 5, app)
+          and controller.store.connection_state == CONNECTED,
+          f"ev={server_h1.event_client_count()} state={controller.store.connection_state}")
+    # 必须被发现：轮询那一拍会查监听线程；发现后走既有的退避重建链路
+    found = wait_until(
+        lambda: controller._event_retry_timer.isActive() or bool(errors), 8, app
+    )
+    check("（H1）事件通道断开被发现（不再是静默失效）", found, str(errors))
+    check("（H1）发现时告诉了用户，且说明会自动重试",
+          any("事件" in item for item in errors), str(errors))
+    # 真正的判据：重建之后事件必须重新流动（只看信号不算修好）
+    rebuilt = wait_until(lambda: server_h1.event_client_count() == 1, 12, app)
+    check("（H1）事件通道已重建", rebuilt, f"ev={server_h1.event_client_count()}")
+    check("（H1）重建后事件重新到达", _scene_event_arrives("开场"),
+          controller.store.current_scene)
+    controller.disconnect()
+    wait_until(lambda: controller.store.connection_state != CONNECTED, 5, app)
+    server_h1.stop()
+
     print("\n[12g] 换服务器时不被上一条连接的残响干扰（回归）")
     # 曾经的缺陷：旧服务器被杀后遗留的传输失败会算到新连接头上，把它误判成掉线 →
     # 排一个重连 → 重连计时器在新连接建立后才到点 → 再 connect 一次 →
@@ -1255,6 +1330,58 @@ def main() -> int:
           str(controller.store.health))
     check("恢复后不再判卡（慢≠断）", controller.store.connection_state == CONNECTED,
           controller.store.connection_state)
+
+    print("\n[14b] H2：心跳失败一次不会把心跳永久卡死")
+    # [14] 为了测"连续超阈值判卡"把阈值压成了 0，这里换回能区分真假的量级：
+    # 一次"上一拍没回来"记的是**满额超时**（request_timeout_s=1.0 → 1000ms），
+    # 本机真实 RTT 只有几毫秒，差两个数量级 —— 平滑算法糊不掉这个差别。
+    controller.config.rtt_warn_ms = 200
+    controller.config.rtt_slow_streak = 2
+    controller.store.set_health(ConnectionHealth())
+
+    # 把 _record_rtt 包一层，事后能逐笔看出记的是"真实往返"还是"满额超时"
+    recorded: list[float] = []
+    real_record_rtt = controller._record_rtt
+
+    def spy_record_rtt(rtt_ms: float) -> None:
+        recorded.append(rtt_ms)
+        real_record_rtt(rtt_ms)
+
+    controller._record_rtt = spy_record_rtt
+    try:
+        # 让服务端把 GetVersion 一律回 204：心跳"发出去、但永远成功不了"，
+        # 正是报告里那条会让心跳永久卡死的场景。
+        active.reject_requests.add("GetVersion")
+        sent_before = active.requests.count("GetVersion")
+        check("心跳失败确实发生了（服务端拒了 GetVersion）",
+              wait_until(
+                  lambda: active.requests.count("GetVersion") > sent_before, 6, app
+              ),
+              str(active.requests.count("GetVersion")))
+        # 等两拍，给旧实现足够机会靠"上一拍还没回来"记满额超时。
+        # 旧实现此时已经不再发请求（标记卡在 True），所以这里多半等不到 ——
+        # 等不到不影响判定，真正的判据在下面两句。
+        wait_until(lambda: active.requests.count("GetVersion") > sent_before + 1, 4, app)
+        active.reject_requests.discard("GetVersion")
+        check("心跳失败不误判卡顿（没把失败记成满额延迟）",
+              not controller.store.health.stalled,
+              f"{controller.store.health} 样本={[round(v) for v in recorded]}")
+        mark = len(recorded)
+        recovered = wait_until(
+            lambda: any(v < 900 for v in recorded[mark:]), 8, app
+        )
+        check("失败之后心跳自行恢复（又能量到真实 RTT）", recovered,
+              f"失败后记录：{[round(v) for v in recorded[mark:]][:6]}")
+        check("恢复后不再判卡", not controller.store.health.stalled,
+              str(controller.store.health))
+        check("恢复后仍在持续心跳", active.requests.count("GetVersion") > sent_before + 1,
+              str(active.requests.count("GetVersion")))
+    finally:
+        controller._record_rtt = real_record_rtt
+        active.reject_requests.discard("GetVersion")
+    controller.config.rtt_warn_ms = 500
+    controller.config.rtt_slow_streak = 3
+
 
     print("\n[15] D17：磁盘与时长预警")
     controller.config.disk_warn_gb = 0.0
@@ -1439,9 +1566,15 @@ def main() -> int:
     # 请求就全被 506 拒掉，而客户端如果只信本地状态，界面上的推杆会一直是"可用但没用"。
     # 这里直接制造这种不同步，验证客户端能纠正自己。
     tbar_srv.state.studio_mode = False          # OBS 侧其实没开
+    # ⚠️ 这里**先排空已排队的轮询回执，再改本地状态**，顺序不能反。
+    # 反过来的话，`processEvents()` 会把"服务端说没开工作室模式"这条陈旧回执
+    # 当场应用，把刚设上的 True 按回去、还顺手把 SetTBarPosition 置灰 ——
+    # 于是下面 set_tbar_position 被"本地不在工作室模式"提前拦掉：位置停在 0、
+    # 请求根本没发出去，后面三条断言连锁红（实测偶发，且插入别的用例、
+    # 轮询相位一变就复现）。这一步与产品逻辑无关，纯粹是测试自己的竞态。
+    app.processEvents()
     controller.store.set_studio_mode(True)    # 本地却以为开着
     controller.store.clear_unavailable("SetTBarPosition")
-    app.processEvents()
     # 同时抓一份原始帧：验证"失败也记成协议原样的响应帧"（含 requestStatus.code）
     # 注意别叫 frames —— [7] 段的 frame_ready lambda 闭包用的就是这个名字，
     # 重名会把那个闭包指向这里，缩略图捕获就悄悄坏掉了
@@ -1469,15 +1602,23 @@ def main() -> int:
           str(controller.store.transitioning))
     # 排障关键：失败必须也进诊断窗口，而且是**协议原样**的 requestStatus 形状。
     # 用户按 requestStatus.code 去找却找不到，就会误判成"OBS 没回响应"。
-    failed_frames = [
-        payload for _, kind, payload in tbar_trace
-        if kind == "response" and isinstance(payload, dict)
-        and isinstance(payload.get("requestStatus"), dict)
-        and payload["requestStatus"].get("result") is False
-    ]
+    def _failed_frames() -> list[dict]:
+        """每次现算：raw_trace 是 worker 线程追加的，不能拿一次快照当结论。"""
+        return [
+            payload for _, kind, payload in list(tbar_trace)
+            if kind == "response" and isinstance(payload, dict)
+            and isinstance(payload.get("requestStatus"), dict)
+            and payload["requestStatus"].get("result") is False
+        ]
+
+    # 必须"等它出现"再下结论：以前这里拿一次快照就断言，而 506 是**跨线程**
+    # 排队回来的（worker → 主线程）。只要机器慢一点、或位置先被别的路径
+    # （例如迟到的 SceneTransitionEnded）归零，快照就会在回执到达之前拍下去，
+    # 于是"没记下失败帧"被误报成失败（实测偶发红一次，复跑就绿）。
     check("失败也记成协议原样的响应帧（含 requestStatus.code）",
-          any(p["requestStatus"].get("code") == 506 for p in failed_frames),
-          str(failed_frames[:1]))
+          wait_until(lambda: any(
+              p["requestStatus"].get("code") == 506 for p in _failed_frames()), 5, app),
+          str(_failed_frames()[:1]))
     check("回读了工作室模式（准备纠正本地状态）",
           wait_until(lambda: tbar_srv.requests.count("GetStudioModeEnabled") > before_caps, 5, app),
           str(tbar_srv.requests.count("GetStudioModeEnabled") - before_caps))

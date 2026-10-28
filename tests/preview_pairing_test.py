@@ -17,8 +17,9 @@
 ------------
 [A] 传输层：迟到的响应不得被下一条请求认领（`core/client_v5.py`）。
     撤掉修复（换回 obsws-python 自带的 ReqClient）这一节必然变红。
-[B] 控制器：画面角色只能来自"在途队列"，对不上的帧必须丢掉，
-    流水线卡死要能整体作废重来。
+[B] 控制器：画面角色只能来自"在途队列"，对不上的帧必须丢掉；
+    流水线卡死要能作废这一拍重来，**但作废不许动队列**——旧请求的结局还在路上，
+    把它们挤掉就等于每帧错一格（`[B4b]`–`[B8]` 就是这一条）。
 """
 
 from __future__ import annotations
@@ -94,6 +95,17 @@ def _frame_holder(raw: bytes):
         image_data = "data:image/png;base64," + base64.b64encode(raw).decode()
 
     return _Resp()
+
+
+def describe(frames: list[tuple[str, bytes]]) -> list[tuple[str, str]]:
+    """把 (角色, 图) 说成人话：这块画面上**其实是哪个场景**的图。
+
+    断言失败时只看 ["preview", "program"] 看不出问题 —— 角色一直是对的，
+    错的是"这一格装的是谁的图"。直接照现场用户的话说：
+    输出窗里出现了预览场景的画面。
+    """
+    names = {expected_frame(scene): scene for scene in ("预览A", "输出B", "主画面")}
+    return [(role, names.get(raw, "?")) for role, raw in frames]
 
 
 # ---------------------------------------------------------------- [A] 传输层
@@ -182,7 +194,7 @@ def test_controller_roles(app: QApplication) -> None:
             "[B2] 回来的帧按 preview → program 贴角色",
             frames
             == [("preview", preview_bytes), ("program", program_bytes)],
-            str([role for role, _ in frames]),
+            str(describe(frames)),
         )
 
         controller._handle_get_source_screenshot(_frame_holder(expected_frame("主画面")))
@@ -192,17 +204,77 @@ def test_controller_roles(app: QApplication) -> None:
             f"帧数 {len(frames)}",
         )
 
-        # 流水线卡死：某一路在途迟迟没下文 → 整体作废重来
-        controller._frame_pending = {"preview": time.monotonic() - FRAME_STALE_SECONDS - 1}
-        controller._frame_queue.clear()
-        controller._frame_queue.append("preview")
-        sent.clear()
-        controller._on_frame_tick()
+        # ---- 流水线卡死：某一路在途迟迟没下文 → 作废这一拍重来 ----
+        # 现场：作废那一刻，那条旧请求的结局（回图 / 失败）**还在路上**。
+        # 归属只看队列顺序（响应不带 sceneName），所以作废时如果连队列一起清掉，
+        # 那些结局就只能去顶新请求的位置 —— 从此每帧错一格，表现正是
+        # "输出窗显示预览场景、预览窗不动"（`c907080` 修过的现场的另一条路）。
+        def arm_stale() -> None:
+            """造出"一条请求已作废、结局还没到"的现场。"""
+            controller._frame_queue.clear()
+            controller._frame_pending = {
+                "preview": time.monotonic() - FRAME_STALE_SECONDS - 1
+            }
+            controller._frame_orphans = 0
+            controller._frame_queue.append("preview")
+            sent.clear()
+            frames.clear()
+            controller._on_frame_tick()
+
+        arm_stale()
         check(
-            "[B4] 卡死的流水线整体作废，下一拍重新要两张图",
-            [d.get("sourceName") for _, d in sent] == ["预览A", "输出B"]
+            "[B4] 卡死的流水线作废后，下一拍照样重新要两张图",
+            [d.get("sourceName") for _, d in sent] == ["预览A", "输出B"],
+            str([d.get("sourceName") for _, d in sent]),
+        )
+        check(
+            "[B4b] 作废只清在途标记：队列里那条旧请求仍留着（结局还没到）",
+            list(controller._frame_queue) == ["preview", "preview", "program"]
+            and getattr(controller, "_frame_orphans", None) == 1,
+            f"queue={list(controller._frame_queue)} "
+            f"orphans={getattr(controller, '_frame_orphans', None)}",
+        )
+
+        # 变体一：旧请求的**响应**迟到（服务器晚回，客户端还没超时）
+        controller._handle_get_source_screenshot(_frame_holder(expected_frame("主画面")))
+        check(
+            "[B5] 作废前那条请求的响应迟到 → 只还账，不贴角色",
+            frames == []
+            and getattr(controller, "_frame_orphans", None) == 0
             and list(controller._frame_queue) == ["preview", "program"],
-            f"sent={[d.get('sourceName') for _, d in sent]} queue={list(controller._frame_queue)}",
+            f"frames={[role for role, _ in frames]} "
+            f"orphans={getattr(controller, '_frame_orphans', None)} "
+            f"queue={list(controller._frame_queue)}",
+        )
+        controller._handle_get_source_screenshot(_frame_holder(preview_bytes))
+        controller._handle_get_source_screenshot(_frame_holder(program_bytes))
+        check(
+            "[B6] 之后两块画面仍各归各位（没有错一格）",
+            frames == [("preview", preview_bytes), ("program", program_bytes)],
+            str(describe(frames)),
+        )
+
+        # 变体二：旧请求的**失败**迟到（超时）—— 这才是现场那条路。
+        # 旧实现盲取队首，消费掉的是**新请求**的在途标记：那一格再也不重发，
+        # 之后每帧错一格。
+        arm_stale()
+        controller._on_request_failed("GetSourceScreenshot", "超时", True, 0)
+        check(
+            "[B7] 作废前那条请求的失败迟到 → 不得消费新请求的在途标记",
+            frames == []
+            and set(controller._frame_pending) == {"preview", "program"}
+            and list(controller._frame_queue) == ["preview", "program"]
+            and getattr(controller, "_frame_orphans", None) == 0,
+            f"pending={sorted(controller._frame_pending)} "
+            f"queue={list(controller._frame_queue)} "
+            f"orphans={getattr(controller, '_frame_orphans', None)}",
+        )
+        controller._handle_get_source_screenshot(_frame_holder(preview_bytes))
+        controller._handle_get_source_screenshot(_frame_holder(program_bytes))
+        check(
+            "[B8] 之后两块画面仍各归各位（画面不再对调）",
+            frames == [("preview", preview_bytes), ("program", program_bytes)],
+            str(describe(frames)),
         )
     finally:
         controller.send = real_send

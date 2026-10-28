@@ -72,6 +72,11 @@ TBAR_NO_EFFECT_CHECK_MS = 3000
 # 对应那块画面再也不刷新（"预览窗一直不动"）。
 FRAME_STALE_SECONDS = 3.0
 
+# F2：缩略图"在途队列"的硬上限。正常最多 2 条（演播室模式一预览一输出），
+# 作废重来会再叠 2 条。真到超过这个数，说明结局根本不再回来了（连接半死），
+# 此时留住队列也救不回归属，只要求别把内存和日志拖爆。
+MAX_FRAME_QUEUE_LEN = 8
+
 # E9：批量静音的收尾等待窗口。
 # 用"时间窗口"而不是"计数到零"来界定这一批：`request_failed` 只带
 # requestType、**不带 inputName**，靠计数递减无法区分"批量里的失败"与
@@ -196,6 +201,12 @@ class Controller(QObject):
         # 在途的角色 -> 发出请求的时刻（monotonic）。用时间戳而不是 set：
         # 卡住的那一拍要靠它判超时（见 _expire_stale_frames）。
         self._frame_pending: dict[str, float] = {}
+        # "欠账"：已经发出去、但结局（回图 / 拒 / 超时）还没到账的请求条数。
+        # 只在"流水线作废重来"时记账 —— 那一刻我们把在途标记清了，但队列里那些
+        # 条目代表的是**真实发出去过的请求**，它们的结局一定还会回来。回来时必须
+        # 只把队列推进一格、**不贴角色**，否则会顶掉新请求的位置，
+        # 从此每帧错一格（输出窗显示预览场景、预览窗不动）。
+        self._frame_orphans: int = 0
 
         # A11：连接健康心跳。空闲时发一次 GetVersion，用它量 RTT。
         # 刻意**不用** GetStats：那一拍本来就够重，再叠心跳会互相干扰计时。
@@ -203,7 +214,13 @@ class Controller(QObject):
         self._heartbeat_timer.setInterval(max(self.config.heartbeat_interval_ms, 1000))
         self._heartbeat_timer.timeout.connect(self._on_heartbeat)
         self._heartbeat_sent_at: float = 0.0
-        self._heartbeat_pending: bool = False
+        # 在途心跳的"最晚该回来的时刻"（monotonic）。0 = 当前没有在途心跳。
+        # 为什么不是 bool：一条 GetVersion 有可能**永远不回来** —— 被服务端拒
+        # （204/604）、连接抖了一下、或者干脆丢了。bool 一旦置上，只有"回执"这条
+        # 路会复位它，失败路径没人管 → 此后每一拍都走"上一拍还没回来"分支记一次
+        # 满额超时，`stalled` 永久为真，而连接其实一直是好的（H2）。
+        # 换成截止时刻就能自己作废：过点即视为这一拍失败，下一拍照常发。
+        self._heartbeat_deadline: float = 0.0
 
         # D17：录制目录只拉一次，之后靠本地磁盘查剩余空间
         self._record_directory: str = ""
@@ -335,7 +352,7 @@ class Controller(QObject):
         # 新连接：录制目录要重新问（可能换了台机器），RTT 样本也从头算
         self._record_directory = ""
         self._record_directory_asked = False
-        self._heartbeat_pending = False
+        self._heartbeat_deadline = 0.0
         self.store.set_health(ConnectionHealth())
 
         if protocol == P4.MODE_COMPAT:
@@ -365,6 +382,10 @@ class Controller(QObject):
         # （表现为同一批请求被重复下发）。
         self._reconnect_timer.stop()
         self._awaiting_cleanup = False
+        # 新连接＝事件通道重试预算重新开始。不重置的话，上一条连接把 4 次
+        # 重试用光之后，这条连接即使事件通道又断了也不会再重试（静默失效）。
+        self._event_retry_timer.stop()
+        self._event_retry_attempt = 0
         self._poll_timer.start()
         self._frame_timer.start()
         self._start_heartbeat()
@@ -454,6 +475,10 @@ class Controller(QObject):
         """事件通道就绪（首次或重试成功）。"""
         if self._event_retry_attempt:
             logger.info("事件通道已重建成功（此前重试 %d 次）", self._event_retry_attempt)
+        # 建好就把重试预算清零，**包括"刚建好又被掐断"的情况**。
+        # 看着像会让"连上就断"退化成每两秒一次的重建循环，但那是有意的取舍：
+        # 耗尽 4 次后永久静默，正是本次要修的病症（用户只能手动重连）；
+        # 而每两秒重试一次的代价是几行日志，并且 OBS 一恢复就自动接上。
         self._event_retry_attempt = 0
         self._event_retry_timer.stop()
 
@@ -487,7 +512,7 @@ class Controller(QObject):
         self._poll_timer.stop()
         self._frame_timer.stop()
         self._heartbeat_timer.stop()
-        self._heartbeat_pending = False
+        self._heartbeat_deadline = 0.0
         self._transition_watchdog.stop()
         # 主动断开/掉线时别再去重建事件通道了
         self._event_retry_timer.stop()
@@ -495,6 +520,7 @@ class Controller(QObject):
         self._tbar_effect_timer.stop()
         self._frame_queue.clear()
         self._frame_pending.clear()
+        self._frame_orphans = 0
         self._pending_audio.clear()
         # 可见性查询队列同样要清：断开后残留的登记会让下一条连接的
         # 首批响应错位（旧世代会被 generation 挡掉，但队列本身得干净）
@@ -506,6 +532,11 @@ class Controller(QObject):
     def _on_poll(self) -> None:
         if self.store.connection_state != CONNECTED:
             return
+        # H1：事件通道是**另一条** websocket，建好之后断了没人会通知我们
+        # （obsws-python 的事件线程静默退出，见 obs_worker._on_event_link_check）。
+        # 借轮询这一拍让 worker 在自己线程里查一眼监听线程还在不在：
+        # 每秒一次布尔判断，比"多久没收到事件就怀疑"可靠得多。
+        self._worker.request_event_link_check.emit()
         self.send(P.REQ_GET_RECORD_STATUS)
         self.send(P.REQ_GET_STREAM_STATUS)
         self._poll_ticks += 1
@@ -561,20 +592,29 @@ class Controller(QObject):
         """
         if self.store.connection_state != CONNECTED:
             return
-        if self._heartbeat_pending:
-            # 上一拍还没回来 —— 说明确实卡住了，直接记一次超时样本，
-            # 不用等真正的超时把界面吊着
+        now = time.monotonic()
+        if self._heartbeat_deadline:
+            if now < self._heartbeat_deadline:
+                # 上一拍还在给它留的预算内，不重复发 —— 越堆越多只会把
+                # 后面每一拍都算成"满载"
+                return
+            # 过点了还没回 —— 这一拍确实卡住了，记一次满额超时样本，
+            # 并**把在途标记作废**。少了这句，下面虽然 return 了，标记却留着，
+            # 下一拍又走这个分支，`stalled` 就再也下不来了（H2）。
+            self._heartbeat_deadline = 0.0
             self._record_rtt(self.config.request_timeout_s * 1000)
             return
-        self._heartbeat_pending = True
-        self._heartbeat_sent_at = time.monotonic()
+        self._heartbeat_sent_at = now
+        self._heartbeat_deadline = now + max(self.config.request_timeout_s, 0.1)
         self.send(P.REQ_GET_VERSION)
 
     def _handle_get_version(self, data) -> None:
         """心跳回执。注意：握手那次 GetVersion 走的不是这条路（走 connected 载荷）。"""
-        if not self._heartbeat_pending:
+        if not self._heartbeat_deadline:
+            # 没有在途心跳 —— 要么握手请求的残响，要么这一拍已经按超时结算了。
+            # 迟到的样本不该再记一次，否则一次失败被记成"超时 + 很慢"两笔。
             return
-        self._heartbeat_pending = False
+        self._heartbeat_deadline = 0.0
         elapsed = (time.monotonic() - self._heartbeat_sent_at) * 1000
         self._record_rtt(elapsed)
 
@@ -1564,9 +1604,9 @@ class Controller(QObject):
         except Exception:  # noqa: BLE001
             logger.exception("处理 %s 响应时出错", request_type)
 
-    # 能力列表不在这里处理：握手时那一次 GetVersion 在 _on_connected 里就已落地，
-    # 曾经这里有个 _handle_get_version，但没有任何路径会发出 GetVersion 请求，
-    # 于是 supported_requests 永远是空集、supports() 永远乐观返回 True —— 能力探测形同虚设。
+    # 能力列表不在这里处理：握手时那一次 GetVersion 在 _on_connected 里就已落地。
+    # 运行期间还会再发 GetVersion —— 那是 A11 的心跳（见 _handle_get_version），
+    # 回执只用来量 RTT，**不重算** supported_requests：能力是连接建立时的静态全集。
 
     def _handle_get_scene_list(self, data) -> None:
         raw_scenes = getattr(data, "scenes", []) or []
@@ -1948,6 +1988,26 @@ class Controller(QObject):
         self._apply_item_enabled(scene, item_id, enabled)
 
     # ---- F2：缩略图 ----
+    def _take_frame_slot(self) -> tuple[str | None, bool]:
+        """给"一条缩略图请求的结局"占位：队列推进一格，并说明它是不是作废前的欠账。
+
+        返回 `(role, orphan)`：
+        - `role is None` → 队列里没有对应请求，这个结局无人认领（直接丢）；
+        - `orphan is True` → 这一格属于**作废之前**那条请求（见 `_expire_stale_frames`），
+          只还账，**不许贴角色**。
+
+        响应（回图）与失败（被拒 / 超时）**必须走同一个入口**。原先是各写一遍，
+        失败那条盲取队首，把新请求的在途标记消费掉了 —— 于是新请求再也不会重发、
+        两块画面从此错一格。
+        """
+        if not self._frame_queue:
+            return None, False
+        role = self._frame_queue.popleft()
+        if self._frame_orphans > 0:
+            self._frame_orphans -= 1
+            return role, True
+        return role, False
+
     def _handle_get_source_screenshot(self, data) -> None:
         """一张缩略图回来了，按"在途队列"给它贴上角色（preview / program）。
 
@@ -1957,10 +2017,16 @@ class Controller(QObject):
         现场表现正是"点场景后输出窗切到了预览场景、预览窗不动"。
         对不上的帧宁可丢掉：丢一帧只是晚一拍出图，贴错角色是一直错下去。
         """
-        if not self._frame_queue:
+        role, orphan = self._take_frame_slot()
+        if role is None:
             logger.debug("收到没有对应请求的缩略图，已丢弃（无法判定它属于预览还是输出）")
             return
-        role = self._frame_queue.popleft()
+        if orphan:
+            logger.debug(
+                "作废前那条缩略图请求的响应回来了，按欠账丢弃（还欠 %d 条）",
+                self._frame_orphans,
+            )
+            return
         self._frame_pending.pop(role, None)
         image_data = getattr(data, "image_data", "") or ""
         payload = image_data.split(",", 1)[-1] if "," in image_data else image_data
@@ -1972,14 +2038,19 @@ class Controller(QObject):
             logger.debug("缩略图解码失败", exc_info=True)
 
     def _expire_stale_frames(self, now: float) -> None:
-        """整条缩略图流水线卡住时整体作废，别让某块画面永久冻住。
+        """整条缩略图流水线卡住时作废这一拍，别让某块画面永久冻住。
 
         正常情况下每条请求都会有结果：要么回图（`_handle_get_source_screenshot`），
         要么被服务端拒/超时（`_on_request_failed`），队列和"在途"标记都会推进。
-        但只要哪一环彻底没了下文，那一格就会永久占着位 —— 该角色再也不会发请求
+        但只要哪一环没了下文，那一格就会永久占着位 —— 该角色再也不会发请求
         （画面冻住），队列里的占位还会让之后每一帧都错位一格。
-        所以这里按"最老的在途请求"卡一个上限，超了就整条清空重来：
-        清空是安全的，因为清空之后对不上的帧会被 `_handle_get_source_screenshot` 丢掉。
+
+        ⚠️ 作废**只清在途标记，不清队列**。队列里每一格都代表一条真实发出去过的
+        请求，它的结局一定还在路上（worker 保证每条请求恰好收一次尾：回图、被拒、
+        超时或断线，见 `_on_execute`）。把队列一起清掉，这些结局回来时就只能去顶
+        新请求的位置 —— 归属只看队列顺序，于是从此每帧错一格：
+        输出窗显示预览场景、预览窗不动（就是 `c907080` 修过的那个现场，另一条路）。
+        所以这里改成"记账"：欠下的条数记进 `_frame_orphans`，结局到了只还账不贴角色。
         """
         if not self._frame_pending:
             return
@@ -1988,12 +2059,22 @@ class Controller(QObject):
         if now - max(self._frame_pending.values()) <= deadline:
             return
         logger.warning(
-            "缩略图流水线超过 %.1fs 没有下文，整体作废重来（在途：%s）",
+            "缩略图流水线超过 %.1fs 没有下文，作废这一拍重来（在途：%s，此前另欠 %d 条）",
             deadline,
             "、".join(sorted(self._frame_pending)),
+            self._frame_orphans,
         )
-        self._frame_queue.clear()
+        self._frame_orphans += len(self._frame_pending)
         self._frame_pending.clear()
+        # 兜底：真碰上"结局再也不来"（连接半死），队列会一直长。超上限就从最老的
+        # 一端丢 —— 那种场景下归属本来就救不回来，唯一要求是别把内存和日志拖爆。
+        while len(self._frame_queue) > MAX_FRAME_QUEUE_LEN:
+            self._frame_queue.popleft()
+            self._frame_orphans = max(0, self._frame_orphans - 1)
+            logger.error(
+                "缩略图队列积压超过 %d 条，丢弃最老的一条（连接很可能已经半死）",
+                MAX_FRAME_QUEUE_LEN,
+            )
 
     @Slot()
     def _on_frame_tick(self) -> None:
@@ -2336,9 +2417,24 @@ class Controller(QObject):
     def _on_request_failed(
         self, request_type: str, message: str, transport_lost: bool, code: int = 0
     ) -> None:
+        if request_type == P.REQ_GET_VERSION:
+            # 心跳失败：先作废在途标记，否则下一拍会以为"上一拍还在路上"，
+            # 一直不重发，也就永远测不到 RTT，`stalled` 一旦置上再也回不去（H2）。
+            # 这里**只清标记**，后面的分流照走不误：204/604 该置灰还得置灰，
+            # 传输级失败该计入掉线判定还得计入。
+            self._heartbeat_deadline = 0.0
         if request_type == P.REQ_GET_SOURCE_SCREENSHOT:
-            # 缩略图 1fps 地失败会刷屏，静默丢弃并放回配额
-            role = self._frame_queue.popleft() if self._frame_queue else None
+            # 缩略图 1fps 地失败会刷屏，静默丢弃并放回配额。
+            # 与回图走同一个占位入口（`_take_frame_slot`）：作废前那条请求的失败
+            # 是"欠账"，只还账、不能去消费新请求的在途标记（消费了那一格就永远
+            # 不再重发，两块画面从此错一格）。
+            role, orphan = self._take_frame_slot()
+            if orphan:
+                logger.debug(
+                    "作废前那条缩略图请求的失败回来了，按欠账丢弃（还欠 %d 条）",
+                    self._frame_orphans,
+                )
+                return
             if role:
                 self._frame_pending.pop(role, None)
             logger.debug("获取缩略图失败：%s", message)

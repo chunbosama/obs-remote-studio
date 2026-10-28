@@ -419,6 +419,24 @@ def e2e_tests() -> None:
           and store.supports(P.REQ_GET_VERSION))
     check("RTT 数值合理（>0）", store.health.rtt_ms > 0, str(store.health.rtt_ms))
 
+    print("\n[B5b] 事件通道自检在 v4 上也不许误报（H1）")
+    # H1 的检测靠 `_events.worker.is_alive()`。v4 的 V4EventClient 是自己写的，
+    # 线程属性同名但实现不同 —— 这里确认那条判据在 v4 上也成立，
+    # 否则健康连接会被每秒误判成"事件通道已断开"，反复重建。
+    link = controller.worker._events
+    check("v4 的事件连接也暴露了监听线程",
+          link is not None and getattr(link, "worker", None) is not None)
+    check("v4 的监听线程是活的",
+          link is not None and link.worker.is_alive())
+    raised: list[str] = []
+    store.error_raised.connect(lambda title, detail: raised.append(f"{title}:{detail}"))
+    for _ in range(10):          # 走几拍轮询，让自检被调用若干次
+        app.processEvents()
+        time.sleep(0.05)
+    check("v4 健康连接上自检不报错、不排重建",
+          not raised and not controller._event_retry_timer.isActive(),
+          f"errors={raised} active={controller._event_retry_timer.isActive()}")
+
     print("\n[B6] 录制与推流")
     controller.toggle_record()
     wait_until(lambda: store.record.active, 6, app)
