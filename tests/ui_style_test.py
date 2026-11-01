@@ -519,9 +519,15 @@ def main() -> int:
 
     def drag_to(value: int) -> list[tuple[float, bool]]:
         tbar_calls.clear()
+        # **必须模拟"按住"**：生产代码只认拖动（`isSliderDown()`），
+        # 因为点击轨道 / 方向键 / 程序 setValue 也会改值，却**不会产生
+        # sliderReleased** —— 放行就会开一个收不掉的"手动转场会话"。
+        # 松手由 setSliderDown(False) 触发 sliderReleased，别再多调一次
+        # _on_tbar_released（那会多发一套 release）。
+        column.tbar.setSliderDown(True)
         column.tbar.setValue(value)
         column._flush_tbar()          # 节流到点，把中间值发出去
-        column._on_tbar_released()    # 用户松手
+        column.tbar.setSliderDown(False)
         return list(tbar_calls)
 
     calls = drag_to(30)

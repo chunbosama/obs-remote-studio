@@ -27,8 +27,12 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from fake_obs_server import DEFAULT_PASSWORD, FakeObsServer, make_png, screenshot_shade  # noqa: E402
 
+from obs_remote_studio.core import controller as controller_mod  # noqa: E402
 from obs_remote_studio.core import protocol as P  # noqa: E402
-from obs_remote_studio.core.controller import Controller  # noqa: E402
+from obs_remote_studio.core.controller import (  # noqa: E402
+    DISK_USAGE_TTL_S,
+    Controller,
+)
 from obs_remote_studio.core.models import ConnectionConfig, ConnectionHealth  # noqa: E402
 from obs_remote_studio.core.state_store import (  # noqa: E402
     CONNECTED,
@@ -1417,6 +1421,59 @@ def main() -> int:
           controller.store.record_warning.message)
     controller.config.disk_warn_gb = 2.0
     controller.config.record_warn_gb = 0.0
+
+    print("\n[15b] H4：剩余空间查询走缓存（别在 UI 线程里每秒阻塞一次）")
+    # 录制目录是**OBS 那台机器**上的路径：局域网映射盘 / 已断开的 UNC 上
+    # `shutil.disk_usage` 会阻塞到 SMB 超时，而这条路每拍轮询都会走一次 ——
+    # 表现为界面每秒顿一下、拖推子掉帧，日志里什么都没有（查得慢，不是查出错）。
+    disk_calls: list[str] = []
+    real_disk_free_gb = controller_mod._disk_free_gb
+    real_dir = controller._record_directory
+    real_cache = controller._free_space_cache
+
+    def spy_disk_free_gb(path: str) -> float:
+        disk_calls.append(path)
+        return 123.0
+
+    try:
+        controller_mod._disk_free_gb = spy_disk_free_gb
+        controller._free_space_cache = None
+        controller._record_directory = r"\\别的机器\录像"
+        check("首次查询拿到剩余空间", controller._free_space_gb() == 123.0)
+        for _ in range(5):
+            controller._free_space_gb()
+        check("接下来五拍不再真的去查盘（缓存生效）",
+              len(disk_calls) == 1, f"查了 {len(disk_calls)} 次")
+        # 换了目录（OBS 那边改了录像路径 / 重连换了台机器）必须立刻重查，不吃旧数
+        controller._record_directory = r"\\另一台机器\录像"
+        controller._free_space_gb()
+        check("换了录制目录立刻重查", len(disk_calls) == 2, f"查了 {len(disk_calls)} 次")
+        cached = controller._free_space_cache
+        if cached is not None:
+            controller._free_space_cache = (
+                cached[0] - DISK_USAGE_TTL_S - 1, cached[1], cached[2]
+            )
+        controller._free_space_gb()
+        check("缓存过期后重查", len(disk_calls) == 3, f"查了 {len(disk_calls)} 次")
+
+        # 查不了也必须缓存：否则那个必然失败的路径每秒重试一次，等于每秒卡一次
+        def unreachable(path: str) -> float:
+            disk_calls.append(path)
+            raise OSError("路径不可达")
+
+        controller_mod._disk_free_gb = unreachable
+        controller._free_space_cache = None
+        controller._record_directory = r"\\不存在的机器\录像"
+        check("查不到时返回 None（界面不显示这一项，不报假数字）",
+              controller._free_space_gb() is None)
+        for _ in range(5):
+            controller._free_space_gb()
+        check("查不到也缓存（不每秒重试那个必然失败的路径）",
+              len(disk_calls) == 4, f"查了 {len(disk_calls)} 次")
+    finally:
+        controller_mod._disk_free_gb = real_disk_free_gb
+        controller._record_directory = real_dir
+        controller._free_space_cache = real_cache
 
     print("\n[16] G4：T 型推杆")
     # 推杆的显隐/可用性现在跟 OBS 版本绑定（29.1.0 起 API 失效），

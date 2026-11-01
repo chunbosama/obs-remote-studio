@@ -25,6 +25,10 @@ _BASE_SUBSCRIPTIONS: int = int(
     | Subs.UI  # 演播室模式开关
     | Subs.MEDIAINPUTS  # L：媒体源播放状态与动作事件
     | Subs.CONFIG  # M：场景集合 / 配置文件切换
+    # 插件（vendor obsrs）的事件：streamStats / tbarChanged / logLine。
+    # 这一位**必须单独订阅**（属于"低容量事件按类别订阅"里的 Vendors 类），
+    # 漏了它的表现是"请求能通、事件一个收不到" —— 很容易被误判成插件不发事件。
+    | Subs.VENDORS
 )
 
 
@@ -80,6 +84,9 @@ EVENTS: dict[str, str] = {
     "CurrentSceneCollectionChanged": "on_current_scene_collection_changed",
     "CurrentProfileChanging": "on_current_profile_changing",
     "CurrentProfileChanged": "on_current_profile_changed",
+    # 插件（obsrs）的 vendor 事件。obsws-python 按 on_<snake> 找回调，
+    # 所以这里必须是 on_vendor_event；真正的子类型在 payload 里分派。
+    "VendorEvent": "on_vendor_event",
 }
 
 # ---------------------------------------------------------------- 请求
@@ -332,6 +339,38 @@ MEDIA_INPUT_KINDS = frozenset({"ffmpeg_source", "vlc_source"})
 def is_media_kind(kind: str) -> bool:
     """`media_source` 是 OBS 内部通用名，也一并认。"""
     return (kind or "") in MEDIA_INPUT_KINDS or (kind or "").startswith("media_source")
+
+# ---------------------------------------------------------------- 插件 vendor 通道
+# 插件（obs-remote-studio-helper）把能力注册成 obs-websocket 的 vendor：
+# 客户端发 `CallVendorRequest`，插件回响应；插件推的事件是 `VendorEvent`。
+# 请求名与字段见 core/plugin.py 的说明（契约文档是唯一出处）。
+REQ_CALL_VENDOR = "CallVendorRequest"
+
+#: 用 "@vendor:" 前缀把"插件请求"塞进现有请求通道。
+#:
+#: 为什么不给 worker 再加一条专门的信号：现有 `_on_execute` 已经把
+#: 「会话号过滤 / 唯一 requestId 配对 / 迟到响应丢弃 / 失败分类」全做完了，
+#: 另起一条必然漏掉其中几样（本项目已经因为"两条路各写一遍"吃过亏）。
+#: 前缀只在 worker 内部转成真正的 CallVendorRequest，界面与诊断窗口看不到它。
+VENDOR_PREFIX = "@vendor:"
+
+
+def vendor_request(name: str) -> str:
+    """插件请求名 → 走请求通道的内部名（`getInfo` → `@vendor:getInfo`）。"""
+    return f"{VENDOR_PREFIX}{name}"
+
+
+def is_vendor_request(request_type: str) -> bool:
+    return (request_type or "").startswith(VENDOR_PREFIX)
+
+
+def vendor_name_of(request_type: str) -> str:
+    return (request_type or "")[len(VENDOR_PREFIX):]
+
+
+def vendor_snake(request_type: str) -> str:
+    """`@vendor:getInfo` → `get_info`（处理函数名用，与其它请求同一套规则）。"""
+    return to_snake(vendor_name_of(request_type))
 
 # ---------------------------------------------------------------- 错误码
 # obs-websocket v5 的 requestStatus.code。100 成功，其它为失败分类。

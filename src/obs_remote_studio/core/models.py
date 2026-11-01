@@ -159,13 +159,21 @@ class ServerInfo:
     # 协议模式：v5 = 标准模式，v4 = 兼容模式（见 protocol_v4）。
     # 存的是常量字符串，不引 Qt/协议模块进来，保持 models 无依赖。
     protocol: str = "v5"
+    # 插件（vendor obsrs）是否装上了。装了就是「进阶模式」——
+    # 这个名字不是"更好的 v5"，而是"多了一个进程内助手"，所以优先于协议维度显示：
+    # 插件只存在于 v5 会话，同时显示"进阶 + 标准"只会让人以为有两个维度。
+    plugin_active: bool = False
+    plugin_version: str = ""
+    plugin_api: int = 0
 
     def label(self) -> str:
         parts = [p for p in (self.obs_version, f"ws {self.websocket_version}") if p]
         return " / ".join(parts) if parts else "未知版本"
 
     def mode_label(self) -> str:
-        """'标准模式' / '兼容模式' —— 标题与状态栏都用它。"""
+        """「进阶模式」/「标准模式」/「兼容模式」—— 标题与状态栏都用它。"""
+        if self.plugin_active:
+            return "进阶模式"
         return "兼容模式" if self.protocol == "v4" else "标准模式"
 
 
@@ -228,3 +236,7 @@ class AppConfig:
     # 见 client_v4.detect_protocol）。也可强制 "v5" / "v4"，
     # 用于中间有代理缓冲首帧、探测可能判错的环境。
     protocol: str = "auto"
+
+    # 插件（OBS 端装 obs-remote-studio-helper）。启用且探测成功 = 进阶模式；
+    # 关掉它就完全不发 CallVendorRequest（连探测都省了），走纯 ws 的标准模式。
+    plugin_enabled: bool = True

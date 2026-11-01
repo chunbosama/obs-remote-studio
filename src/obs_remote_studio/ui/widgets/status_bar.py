@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ...core import plugin as PV
 from ...core.state_store import CONNECTED, CONNECTING, RECONNECTING, StateStore
 from ...utils import icons
 from ...utils.dpi import icon_pixmap
@@ -107,11 +108,18 @@ class StatusBar(QStatusBar):
         store.video_changed.connect(self._update_stats)
         store.health_changed.connect(self._update_health)
         store.record_warning_changed.connect(self._update_warning)
+        # 插件状态变化（装上 / 掉了 / 开始远程采画面）都要重刷版本段：
+        # 模式名与"远程采集中"都挂在这一段上。
+        store.plugin_changed.connect(lambda: self._update_version(self.store.server_info))
 
         self.apply_segments()
         self._update_signal()
         self._update_warning()
         self._update_health()
+        # 构造时按当前状态刷一次"版本/模式"段：常规路径下窗口先于连接建立，
+        # 但"已经连上再开窗"（测试、将来的多窗口）时也必须立刻是对的 ——
+        # 否则这一格要到下一次 server_info_changed 才有字，空白看着像"没连上"。
+        self._update_version(self.store.server_info)
 
     # ---------------------------------------------------------------- H9：段管理
     def apply_segments(self) -> None:
@@ -198,18 +206,49 @@ class StatusBar(QStatusBar):
         self.target_label.setText(message)
 
     def _update_version(self, info) -> None:
-        # 版本段兼作"协议模式"指示：v4（兼容模式）下写清"兼容模式"，
-        # 免得用户以为功能缺失是软件坏了。v5 时不加后缀，保持原本的简洁。
+        # 版本段兼作"模式"指示，三态：
+        #   进阶模式（装了插件）> 标准模式（v5）> 兼容模式（v4）。
+        # 不能只显示"标准"——用户装了插件却看到标准，会以为插件没生效；
+        # 也不能只显示"进阶"而不讲清楚它强在哪，那样等于没说。
         text = info.label()
-        if getattr(info, "protocol", "v5") == "v4":
-            self.version_label.setText(f"{text} · 兼容模式（v4）")
+        mode = info.mode_label()
+        # 探测中（getInfo 还在路上）：这会儿"有没有插件"根本还不知道，
+        # 一律不许先写「标准模式」—— 否则连上那一瞬会先给一个错的模式名再跳变。
+        probing = getattr(self.store, "plugin_state", "") == "probing"
+        capture = self.store.capture if getattr(self.store, "capture", None) else None
+        watching = bool(capture and capture.active)
+        suffix = " · 探测插件中…" if probing else f" · {mode}"
+        if watching:
+            # 远程采画面是隐私事件，状态栏必须有痕迹；只有标题上写，最小化就看不见了。
+            viewers = f" {capture.viewers} 人" if capture.viewers else ""
+            suffix += f" · 远程采集中{viewers}"
+        self.version_label.setText(f"{text}{suffix}")
+
+        if probing:
+            self.version_label.setToolTip(
+                "正在询问 OBS 端是否装了插件…\n"
+                "装了进「进阶模式」，没装则按「标准模式」（v5）或「兼容模式」（v4）运行。"
+            )
+        elif mode == PV.MODE_ADVANCED:
+            version = getattr(info, "plugin_version", "") or "未知版本"
+            tip = (
+                f"已连接 OBS 端插件（{version}），进入进阶模式：\n"
+                "实时画面、机器状态与日志、推杆直驱由插件提供。\n"
+                "插件只补 obs-websocket 够不到的能力，其余控制仍走 ws。"
+            )
+            if watching:
+                tip += f"\n\n当前插件正在向外发送画面，{capture.viewers} 人观看。"
+            self.version_label.setToolTip(tip)
+        elif getattr(info, "protocol", "v5") == "v4":
             self.version_label.setToolTip(
                 "以 obs-websocket v4（OBS ≤ 27）兼容模式连接：\n"
                 "v4 没有的组件（电平表、声道平衡、删除场景等）已自动隐藏或置灰。"
             )
         else:
-            self.version_label.setText(text)
-            self.version_label.setToolTip("")
+            self.version_label.setToolTip(
+                "标准模式：未检测到 OBS 端插件。\n"
+                "实时画面、机器磁盘、OBS 日志、推杆直驱需要安装插件后才会出现。"
+            )
 
     def refresh_icons(self) -> None:
         """换主题后重画信号格与分隔线。"""

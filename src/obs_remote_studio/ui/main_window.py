@@ -31,6 +31,7 @@ from . import theme
 from .dialogs.advanced_audio_dialog import AdvancedAudioDialog
 from .dialogs.connect_dialog import ConnectDialog
 from .dialogs.diagnostics_dialog import DiagnosticsWindow
+from .dialogs.obs_log_dialog import ObsLogWindow
 from .dialogs.quick_transitions_dialog import QuickTransitionsDialog
 from .dialogs.settings_dialog import SettingsDialog
 from .dialogs.stream_caption_dialog import StreamCaptionDialog
@@ -68,6 +69,7 @@ class MainWindow(QMainWindow):
 
         self._advanced_dialog: AdvancedAudioDialog | None = None
         self._diagnostics_dialog: DiagnosticsWindow | None = None
+        self._log_dialog: ObsLogWindow | None = None
         self._caption_dialog = None  # P7：推流字幕（延迟创建，避免未用就建窗）
         self._tray: TrayIcon | None = None
         self._hotkeys = GlobalHotkeys(self)
@@ -83,10 +85,15 @@ class MainWindow(QMainWindow):
 
         self.store.error_raised.connect(self._show_error)
         self.store.server_info_changed.connect(self._update_title)
+        # 插件状态一变（探测出结果 / 采集指示亮起），标题与菜单可用性都要跟着走
+        self.store.plugin_changed.connect(self._sync_plugin_ui)
         # 构造时先按当前状态刷一次标题：正常路径下窗口先于连接建立，
         # 但"已连上再开窗"（如测试、将来可能的多窗口）时也必须是正确的模式标签，
         # 不能停在默认标题上等下一次 server_info_changed。
         self._update_title(self.store.server_info)
+        # 同理：依赖插件的菜单项（如「OBS 日志」）也得当场按可用性置灰，
+        # 否则已连上再开窗时它一直亮着，点了才发现日志窗里写"需要装插件"。
+        self._sync_plugin_ui()
 
         self._restore_layout()
         if controller.config.auto_connect_on_startup and controller.config.connection.host:
@@ -257,6 +264,9 @@ class MainWindow(QMainWindow):
         tools_menu = self.menuBar().addMenu("工具(&T)")
         tools_menu.addAction("高级音频属性…", lambda: self.open_advanced_audio(None))
         tools_menu.addAction("推流字幕…", self.open_stream_caption)  # P7
+        # Q10：OBS 端日志（插件）。没装插件时置灰并说明原因，而不是点了没反应。
+        self.log_action = tools_menu.addAction("OBS 日志（插件）…", self.open_obs_logs)
+        self.log_action.setToolTip("需要 OBS 端安装插件（进阶模式）")
         tools_menu.addAction("诊断窗口（原始 JSON）…", self.open_diagnostics)
         tools_menu.addSeparator()
         tools_menu.addAction("设置…", self._open_settings_dialog)
@@ -384,8 +394,13 @@ class MainWindow(QMainWindow):
             config: ConnectionConfig = dialog.result_config()
             # 协议选择与连接信息一起记住：下次连同一台 OBS 不用再选
             protocol = dialog.protocol_choice()
-            if protocol != getattr(self.controller.config, "protocol", "auto"):
+            plugin_enabled = dialog.plugin_choice()
+            if (
+                protocol != getattr(self.controller.config, "protocol", "auto")
+                or plugin_enabled != getattr(self.controller.config, "plugin_enabled", True)
+            ):
                 self.controller.config.protocol = protocol
+                self.controller.config.plugin_enabled = plugin_enabled
                 self.controller.settings.save_config(self.controller.config)
             self.controller.connect(config)
 
@@ -528,6 +543,42 @@ class MainWindow(QMainWindow):
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+
+    def open_obs_logs(self) -> None:
+        """Q10：OBS 那台机器的日志。非模态，方便一边看日志一边操作。
+
+        这是**只有插件才能给**的东西：ws 没有任何"读日志"的接口，
+        标准模式下列表项置灰并写明原因。
+        """
+        if self._log_dialog is None:
+            self._log_dialog = ObsLogWindow(self.controller, self)
+        dialog = self._log_dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        dialog.refresh()
+
+    def _sync_plugin_ui(self) -> None:
+        """插件状态变化后统一刷新"依赖插件"的界面。
+
+        规矩沿用全项目那一条：**做不到就置灰，并说明原因**。
+        这里的"做不到"有两种：没装插件（标准/兼容模式）、插件太老没这项能力。
+        """
+        from ..core import plugin as PV
+
+        supported = self.controller.plugin_supports(PV.FEATURE_LOGS)
+        action = getattr(self, "log_action", None)
+        if action is not None:
+            action.setEnabled(supported)
+            if not supported:
+                info = self.store.server_info
+                action.setToolTip(
+                    f"当前是{info.mode_label()}：OBS 端日志需要安装插件后才有"
+                    "（ws 没有读日志的接口）"
+                )
+            else:
+                action.setToolTip("读取 OBS 那台机器的最近日志（可自动刷新）")
+        self._update_title(self.store.server_info)
 
     def open_stream_caption(self) -> None:
         """P7：推流字幕窗。非模态，方便一边看画面一边发字幕。
@@ -680,17 +731,31 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, title, detail)
 
     def _show_about(self) -> None:
+        from ..core import plugin as PV
+
         info = self.store.server_info
         mode = info.mode_label()
-        if info.protocol == "v4":
-            protocol_note = (
-                "当前连接的 obs-websocket 是 **v4**（OBS ≤ 27），已启用兼容模式。\n"
+        lines = []
+        if info.plugin_active:
+            lines.append(
+                f"OBS 端插件：{info.plugin_version or '已连接'}"
+                f"（接口 api {info.plugin_api}）"
+            )
+            if self.store.plugin is not None:
+                lines.append(f"插件能力：{PV.feature_summary(self.store.plugin)}")
+            lines.append(
+                "进阶模式 = obs-websocket 控制 + 插件补充的实时画面 / 机器状态 / 日志 / 推杆直驱。"
+            )
+        elif info.protocol == "v4":
+            lines.append(
+                "当前连接的 obs-websocket 是 v4（OBS ≤ 27），已启用兼容模式。\n"
                 "v4 没有的能力（音频电平表、声道平衡、删除场景、场景排序等）\n"
                 "在界面上已自动隐藏或置灰，不会出现「点了没反应」。"
             )
         else:
-            protocol_note = (
-                "当前连接的 obs-websocket 是 v5（标准模式，OBS ≥ 28）。"
+            lines.append(
+                "当前连接的 obs-websocket 是 v5，未检测到 OBS 端插件。\n"
+                "实时画面、机器磁盘、OBS 日志、推杆直驱需要安装插件（进阶模式）。"
             )
         QMessageBox.information(
             self,
@@ -698,23 +763,34 @@ class MainWindow(QMainWindow):
             "OBS Remote Studio\n"
             "通过 obs-websocket 远程控制 OBS Studio。\n\n"
             f"已连接服务端：{info.label()}\n"
-            f"协议模式：{mode}\n\n"
-            f"{protocol_note}\n\n"
-            "订阅事件：Scenes / Outputs / SceneItems / Transitions / Ui\n"
+            f"运行模式：{mode}\n\n"
+            + "\n".join(lines)
+            + "\n\n"
+            "订阅事件：Scenes / Outputs / SceneItems / Transitions / Ui / Vendors\n"
             "界面中置灰的按钮对应 OBS 的编辑类功能，本阶段未接入。",
         )
 
     def _update_title(self, info) -> None:
-        """标题里带上协议模式：v5 = 标准模式，v4 = 兼容模式（需求明确要求）。
+        """标题里带上模式：进阶（装了插件）/ 标准（v5）/ 兼容（v4）。
 
         拿不到版本信息（未连接）时不硬凑一个模式名，免得显示成"标准模式"误导用户。
         """
         if not info or not info.label() or info.label() == "未知版本":
             self.setWindowTitle("OBS Remote Studio（未连接）")
             return
-        self.setWindowTitle(
-            f"OBS Remote Studio — {info.label()}（{info.mode_label()}）"
-        )
+        # 探测中（getInfo 还在路上）不许先写「标准模式」：那一刻"有没有插件"
+        # 还不知道，先报标准再跳进阶等于给了用户一个错的模式名。
+        if getattr(self.store, "plugin_state", "") == "probing":
+            mode = "探测插件中…"
+            capture = None
+        else:
+            mode = info.mode_label()
+            capture = getattr(self.store, "capture", None)
+        if capture is not None and capture.active:
+            # 远程正在采画面：这是隐私事件，标题上必须有痕迹（Q23 采集指示的客户端一侧）
+            viewers = f" {capture.viewers} 人" if capture.viewers else ""
+            mode += f" · 远程采集中{viewers}"
+        self.setWindowTitle(f"OBS Remote Studio — {info.label()}（{mode}）")
 
     # ---------------------------------------------------------------- 主题
     def _on_theme_selected(self) -> None:
@@ -875,6 +951,8 @@ class MainWindow(QMainWindow):
         if self._diagnostics_dialog is not None:
             self._diagnostics_dialog.detach(self.controller.worker)
             self._diagnostics_dialog.close()
+        if self._log_dialog is not None:
+            self._log_dialog.close()
         # H6：可配置"关闭时最小化到托盘"
         if (
             not getattr(self, "_force_quit", False)

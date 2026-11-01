@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ...core import plugin as PV
 from ...core import protocol as P
 from ...core.state_store import CONNECTED, StateStore
 from ...utils.dpi import device_ratio, snap_rect
@@ -203,6 +204,8 @@ class _TransitionColumn(QWidget):
         # 之后任何 setValue 都会回调 _on_tbar_moved，必须能读到这个标志
         self._tbar_applying = False
         self._tbar_pending: float | None = None
+        # 这一按里到底有没有真的推出去过（见 _on_tbar_released）
+        self._tbar_pushed = False
         self._quick_buttons: list[QPushButton] = []
         # 快捷转场行末尾弹簧项的下标（只建一次，见 refresh_quick_slots）
         self._quick_stretch_index: int | None = None
@@ -315,7 +318,10 @@ class _TransitionColumn(QWidget):
 
         self._update_button()
         self.refresh_quick_slots()
-        self.setEnabled(False)
+        # 按**当前**连接状态初始化，不要无条件禁用：常规路径下窗口先于连接建立，
+        # 但"已经连上再开窗"时不会再收到 connection_state_changed，
+        # 无条件 setEnabled(False) 会让整列（含推杆）一直是灰的。
+        self._on_connection_state(self.store.connection_state)
 
     def _update_tbar(self) -> None:
         """外部（OBS 端推的 / 事件回读的）位置同步到滑块，但别触发再次下发。"""
@@ -360,7 +366,11 @@ class _TransitionColumn(QWidget):
         # 版本门槛放在最前面：OBS ≥29.1 的 API 根本完不成手动推杆
         # （obs-studio issue #11372，修复 PR #13143 未合入），这时候**整行藏掉**，
         # 不摆一个必然无效的控件在那儿。
-        version_ok = P.tbar_version_ok(self.store.server_info.obs_version)
+        # **例外**：插件直驱绕开了那个前端控件缺陷（直接对转场对象设手动时间），
+        # 所以装了插件就不再受版本限制 —— 否则"进阶模式"反而永远看不到推杆，
+        # 客户端能推却不肯显示，等于把插件唯一不可替代的能力藏了。
+        plugin_tbar = self.store.supports_plugin(PV.FEATURE_TBAR)
+        version_ok = plugin_tbar or P.tbar_version_ok(self.store.server_info.obs_version)
         self.tbar_row.setVisible(version_ok)
         if not version_ok:
             self.tbar.setEnabled(False)
@@ -383,7 +393,10 @@ class _TransitionColumn(QWidget):
             button.setEnabled(self.store.studio_mode)
 
     def _tbar_usable(self) -> bool:
-        """推杆此刻能不能用：工作室模式 + 协议支持 + 没被 OBS 拒过。"""
+        """推杆此刻能不能用：工作室模式 + 有能力 + 没被 OBS 拒过。"""
+        if self.store.supports_plugin(PV.FEATURE_TBAR):
+            # 插件直驱：不经过前端推杆控件，也就不受"曾被 506 拒过"的降级标记影响
+            return self.store.studio_mode
         return (
             self.store.studio_mode
             and self.store.supports("SetTBarPosition")
@@ -392,7 +405,8 @@ class _TransitionColumn(QWidget):
 
     def _tbar_block_reason(self) -> str:
         """**不能用**的原因，按"最该先解决的那一条"排。"""
-        if not self.store.supports("SetTBarPosition"):
+        if not (self.store.supports_plugin(PV.FEATURE_TBAR)
+                or self.store.supports("SetTBarPosition")):
             # v4 里 SetTBarPosition 只有 4.9.0+ 才有；本项目的合成能力表
             # 只在 v4 上把它算作支持，所以这里要写清是"协议没有"还是"版本不够"
             if self.store.compat_mode:
@@ -440,6 +454,14 @@ class _TransitionColumn(QWidget):
     def _on_tbar_moved(self, value: int) -> None:
         if self._tbar_applying:
             return
+        # **只认"按住拖动"**：点击轨道（跳变）、方向键、以及别处发来的 setValue
+        # 都会改值，但它们**不会产生 sliderReleased**。放行的话就会开一个永远
+        # 收不掉的"手动转场会话"——进阶模式下插件会把 OBS 的转场停在半途，
+        # 之后所有转场（包括「转场动画」按钮）都会被 OBS 静默跳过。
+        # 所以不是按住状态就把滑块拨回真实位置，一个请求都不发。
+        if not self.tbar.isSliderDown():
+            self._apply_tbar_position(self.store.tbar_position)
+            return
         self._tbar_pending = value / 100.0
         if not self._tbar_timer.isActive():
             self._tbar_timer.start()
@@ -449,6 +471,7 @@ class _TransitionColumn(QWidget):
         if self._tbar_pending is None:
             return
         position, self._tbar_pending = self._tbar_pending, None
+        self._tbar_pushed = True
         self.callbacks["tbar"](position, False)
 
     def _on_tbar_released(self) -> None:
@@ -468,6 +491,12 @@ class _TransitionColumn(QWidget):
         self._tbar_timer.stop()
         self._tbar_pending = None
         position = self.tbar.value() / 100.0
+        pushed, self._tbar_pushed = self._tbar_pushed, False
+        # 按住又原地松开、这一按里一个位置都没发出去 → 不要发 release：
+        # 在 OBS 侧 release 带 0 位置等于"取消手动转场"，
+        # 会把一条正常进行中的转场（比如刚点的「转场动画」）一起取消掉。
+        if not pushed and position <= 0.0:
+            return
         if position >= 1.0 - P.TBAR_CLAMP:
             self.callbacks["tbar"](position, True)
         else:
@@ -556,7 +585,9 @@ class PreviewPanel(QWidget):
 
         self._apply_studio_mode()
         self._update_scenes()
-        self.setEnabled(False)
+        # 按当前连接状态初始化（而不是无条件禁用）：已经连上再开窗时
+        # 不会再收到 connection_state_changed，整块面板会一直是灰的。
+        self._on_connection_state(self.store.connection_state)
 
     # ---------------------------------------------------------------- 缩放条
     def _build_zoom_bar(self) -> QFrame:

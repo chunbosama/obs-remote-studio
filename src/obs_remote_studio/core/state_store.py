@@ -21,6 +21,7 @@ from .models import (
     VideoSettings,
     VirtualcamStatus,
 )
+from .plugin import CaptureState, LogLine, MachineStats, PluginInfo
 
 DISCONNECTED = "disconnected"
 CONNECTING = "connecting"
@@ -68,6 +69,9 @@ class StateStore(QObject):
 
     # obs-websocket v4 兼容模式：为 True 时 v4 不支持的组件要隐藏/置灰
     compat_mode_changed = Signal()
+
+    # 插件（vendor obsrs）：探测结果 / 机器状态 / 采集指示 / 日志
+    plugin_changed = Signal()
 
     # A11：连接健康（RTT / 卡顿）
     health_changed = Signal()
@@ -147,6 +151,15 @@ class StateStore(QObject):
         self.profiles: list[str] = []
         self.current_profile: str = ""
 
+        # 插件（vendor obsrs）。`plugin` 为 None = 没装（或探测失败），
+        # 这是一等公民而不是异常分支：全部插件功能都按它逐项降级。
+        self.plugin: PluginInfo | None = None
+        # "probing" / "ready" / "absent"。只用于界面措辞与"别重复探测"。
+        self.plugin_state: str = ""
+        self.machine = MachineStats()
+        self.capture = CaptureState()
+        self.plugin_logs: list[LogLine] = []
+
     # ---------------------------------------------------------------- 写入
     def set_health(self, health: ConnectionHealth) -> None:
         self.health = health
@@ -218,6 +231,53 @@ class StateStore(QObject):
     def set_server_info(self, info: ServerInfo) -> None:
         self.server_info = info
         self.server_info_changed.emit(info)
+
+    # ---------------------------------------------------------------- 插件
+    def set_plugin_probing(self) -> None:
+        """连上之后、`getInfo` 还没回来之前的状态。
+
+        界面上不需要转圈，但**标题与状态栏要能区分"还没探测完"和"确实没有"**，
+        否则连上的那一秒会先闪一下"标准模式"再跳成"进阶模式"。
+        """
+        if self.plugin_state == "probing":
+            return
+        self.plugin_state = "probing"
+        self.plugin_changed.emit()
+
+    def set_plugin(self, info: PluginInfo | None) -> None:
+        """探测结果落地。None = 没装插件（或 getInfo 失败），不再重试。"""
+        self.plugin = info
+        self.plugin_state = "ready" if info is not None else "absent"
+        # 模式名只有一处出处（ServerInfo.mode_label），这里只负责把事实同步过去，
+        # 免得标题、状态栏、关于各算一遍、各说一套。
+        self.server_info.plugin_active = info is not None
+        self.server_info.plugin_version = info.plugin_version if info else ""
+        self.server_info.plugin_api = info.api_version if info else 0
+        if info is None:
+            # 没有插件就别留着上次的机器状态/采集指示，否则界面会展示幻觉数据
+            self.machine = MachineStats()
+            self.capture = CaptureState()
+            self.plugin_logs = []
+        self.plugin_changed.emit()
+        self.server_info_changed.emit(self.server_info)
+
+    def supports_plugin(self, feature: str) -> bool:
+        """插件某项能力是否可用。**支持 != 当前状态允许**（例如推杆要演播室模式）。"""
+        return bool(self.plugin is not None and self.plugin.supports(feature))
+
+    def set_machine(self, stats: MachineStats) -> None:
+        self.machine = stats
+        self.plugin_changed.emit()
+
+    def set_capture(self, state: CaptureState) -> None:
+        if (state.active, state.viewers) == (self.capture.active, self.capture.viewers):
+            return
+        self.capture = state
+        self.plugin_changed.emit()
+
+    def set_plugin_logs(self, lines: list[LogLine]) -> None:
+        self.plugin_logs = list(lines)
+        self.plugin_changed.emit()
 
     def set_scenes(self, scenes: list[Scene], current: str = "") -> None:
         self.scenes = scenes
@@ -551,6 +611,15 @@ class StateStore(QObject):
         self.current_scene_collection = ""
         self.profiles = []
         self.current_profile = ""
+        # 插件是**按连接**的：断开后能力、机器状态、采集指示一律作废。
+        # 但 `server_info.plugin_active` 像 compat_mode 一样保留 —— 标题继续显示
+        # "上次是进阶模式"，断线不该让用户看不出自己刚才连的是什么。
+        self.plugin = None
+        self.plugin_state = ""
+        self.machine = MachineStats()
+        self.capture = CaptureState()
+        self.plugin_logs = []
+        self.plugin_changed.emit()
         self.audio_changed.emit()
         self.scenes_changed.emit()
         self.scene_items_changed.emit()

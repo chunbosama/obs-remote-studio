@@ -29,6 +29,9 @@ MONITOR_NONE = "OBS_MONITORING_TYPE_NONE"
 
 # obs-websocket 的高频事件位（与 obsws_python.Subs 一致）
 HIGH_VOLUME_METERS_BIT = 1 << 16
+# 插件的 VendorEvent 挂在 Vendors 类别（1<<9）下。真实 OBS 只推给订阅了这一位的连接 ——
+# 假服务器也照做，否则"客户端漏订这一位"这个缺陷在测试里永远暴露不出来。
+VENDOR_EVENTS_BIT = 1 << 9
 
 # G4：OBS 里 T 型推杆的完成/回退判定带 10% 量程的容差
 # （T_BAR_CLAMP = T_BAR_PRECISION / 10，见 window-basic-main-transitions.cpp）
@@ -121,6 +124,8 @@ class FakeObsState:
         ]
         self.current_transition = "Fade"
         self.transition_duration = 300
+        # G4：推杆位置（插件 tbar/getTbar 用；SetTBarPosition 那条老路也读它）
+        self.tbar_position = 0.0
         # P3：场景级转场覆盖。key 是场景名，value 是 dict：
         #   {"transition": str | None, "duration": int | None}
         # 键不存在 = 该场景没有覆盖（对应协议里的 null）。
@@ -150,6 +155,9 @@ class FakeObsState:
         self.tbar_calls = 0
         # 推杆正把一次转场"推"在半途 —— 此时真实 OBS 处于 busy 状态
         self.tbar_transitioning = False
+        # 插件直驱的"手动转场会话"是否开着（推了但没 release）。
+        # 真实插件收尾时会把位置归 0 并把会话关掉（见 rsh-tbar.cpp）。
+        self.plugin_tbar_session = False
         # P7：推流字幕。记录收到的每一条（含空串＝清屏），供测试断言
         self.captions: list[str] = []
         # D17：录制目录（客户端据此算剩余空间）
@@ -195,6 +203,11 @@ class FakeObsServer:
         tbar_silent: bool = False,
         obs_version: str = "",
         slow_responses: dict[str, float] | None = None,
+        plugin: bool = False,
+        plugin_features: dict[str, bool] | None = None,
+        plugin_feature_errors: bool = False,
+        plugin_machine: dict | None = None,
+        plugin_logs: list[dict] | None = None,
     ):
         """legacy_transitions=True：模拟 obs-websocket 5.0，只认 GetTransitionList。
         hide_available_requests=True：GetVersion 不上报 availableRequests，
@@ -209,6 +222,16 @@ class FakeObsServer:
         （状态改动照常立即生效）。用来复现"响应比客户端超时还慢"——
         客户端放弃之后那条响应会落到 socket 里，被下一条请求认领，
         正是"预览/输出画面永久对调"的起点。
+
+        plugin=True：模拟 OBS 端装了 **obs-remote-studio-helper**（vendor `obsrs`，
+        接口契约见插件侧 docs/插件接口-MVP.md）。False 时 `CallVendorRequest`
+        回 600 Vendor not found —— 与真实 obs-websocket 一致，客户端据此回落标准模式。
+        plugin_features：覆盖能力矩阵（默认只开 MVP 六项真实实现的那几个）；
+        传 {"tbar": False} 这类是为了验证"插件在、但某项能力没有"的置灰路径。
+        plugin_feature_errors=True：`getInfo` 里的 features 数组会被写成
+        标量数组（libobs 会丢弃元素的那种形状），用来验证客户端不依赖它也能判能力。
+        plugin_machine：覆盖 `getMachineStats` 的返回（默认 C 盘、剩余 85 GB）。
+        plugin_logs：`getRecentLogs` 的环形缓冲（默认两条 warning + 一条 info）。
         """
         self.host = host
         self.port = port
@@ -232,6 +255,76 @@ class FakeObsServer:
         self.obs_version = obs_version
         # {请求名: 秒数}：下一次这条请求的响应延迟多久才发（一次性）
         self.slow_responses: dict[str, float] = dict(slow_responses or {})
+        # ---- 插件（vendor obsrs）----
+        self.plugin = plugin
+        # 契约里"未实现的能力显式给 false"，所以默认值就是 MVP 真有的那几项。
+        self.plugin_features: dict[str, bool] = {
+            "info": True,
+            "stream.mjpeg": True,
+            "stream.role.preview": False,
+            "tbar": True,
+            "machine.stats": True,
+            "logs": True,
+            "encoder.stats": False,
+            "capture.indicator": True,
+        }
+        if plugin_features:
+            self.plugin_features.update(plugin_features)
+        self.plugin_feature_errors = plugin_feature_errors
+        # 每次插件请求都记一笔：(requestType, requestData)，断言用
+        self.plugin_calls: list[tuple[str, dict]] = []
+        self.plugin_version = "0.2.0"
+        self.plugin_machine: dict = dict(
+            plugin_machine
+            or {
+                "hostname": "FAKE-OBS-PC",
+                "obsUptimeMs": 3_600_000,
+                "recordDir": {
+                    "known": True,
+                    "path": "C:\\Users\\si\\Videos",
+                    "isUnc": False,
+                    "exists": True,
+                    "writable": True,
+                    "writeError": 0,
+                },
+                "disk": {
+                    "known": True,
+                    "totalBytes": 512 * 1024 ** 3,
+                    "freeBytes": 85 * 1024 ** 3,
+                    "availBytes": 85 * 1024 ** 3,
+                    "error": 0,
+                },
+                "recording": {
+                    "active": False,
+                    "paused": False,
+                    "currentFile": "",
+                    "currentFileBytes": 0,
+                    "lastFile": "",
+                },
+            }
+        )
+        self.plugin_logs: list[dict] = list(
+            plugin_logs
+            if plugin_logs is not None
+            else [
+                {
+                    "timestamp": 1_793_356_000_000,
+                    "level": 300,
+                    "levelName": "info",
+                    "message": "obs-websocket started",
+                },
+                {
+                    "timestamp": 1_793_356_001_000,
+                    "level": 200,
+                    "levelName": "warning",
+                    "message": "Failed to connect to server: connection timed out",
+                },
+            ]
+        )
+        self.plugin_capture_active = False
+        self.plugin_capture_viewers = 0
+        self.plugin_stream_active = False
+        self.plugin_stream_enabled = False
         self.state = FakeObsState()
         self.requests: list[str] = []
 
@@ -374,6 +467,9 @@ class FakeObsServer:
             "SetInputAudioSyncOffset",
             "GetInputAudioTracks",
             "SetInputAudioTracks",
+            # 插件（vendor）的统一入口。真实 obs-websocket 无论装没装插件都有这条；
+            # vendor 不存在时回 600，客户端据此判定"没装插件"。
+            "CallVendorRequest",
         ]
         # 5.0 只有 GetTransitionList；5.1+ 换成 GetSceneTransitionList
         base += ["GetTransitionList" if self.legacy_transitions else "GetSceneTransitionList"]
@@ -537,6 +633,164 @@ class FakeObsServer:
         for item in events:
             await self.broadcast(*item)
 
+    # ---------------------------------------------------------------- 插件（vendor obsrs）
+    def _dispatch_vendor(self, payload: dict):
+        """`CallVendorRequest` 的分发。
+
+        契约（插件侧 docs/插件接口-MVP.md）里两条硬约束必须照抄：
+        ①未知 vendor 回 600 —— 客户端就是靠"这条失败"判定"没装插件"；
+        ②每个响应都带 `ok`，失败时 `ok=false` + 人读的 `error`。
+        """
+        vendor = str(payload.get("vendorName", "") or "")
+        request = str(payload.get("requestType", "") or "")
+        data = payload.get("requestData") or {}
+        self.plugin_calls.append((request, data))
+        if not self.plugin or vendor not in ("obsrs", "obs-remote-studio-helper"):
+            return None, ("__error__", (600, "Vendor not found"))
+        inner = self._vendor_result(request, data)
+        if inner is None:
+            # vendor 侧没有这个请求名：与 obs-websocket 的 204 同义
+            return None, ("__error__", (204, f"Vendor request {request} is not valid"))
+        return {"vendorName": "obsrs", "requestType": request, "responseData": inner}, None
+
+    def _vendor_result(self, request: str, data: dict) -> dict | None:
+        st = self.state
+        if request == "getInfo":
+            features: list = [
+                {"name": name, "enabled": bool(enabled)}
+                for name, enabled in self.plugin_features.items()
+            ]
+            if self.plugin_feature_errors:
+                # 复现 libobs 序列化的坏形状：标量数组元素会被丢掉，只剩名字
+                features = list(self.plugin_features)
+            return {
+                "ok": True,
+                "pluginVersion": self.plugin_version,
+                "apiVersion": 1,
+                "vendor": "obsrs",
+                "obsVersion": self.obs_version or "31.0.0",
+                "websocketApiVersion": "v3",
+                "features": features,
+                "featureMap": dict(self.plugin_features),
+                "limits": {
+                    "maxWidth": 3840,
+                    "maxHeight": 2160,
+                    "maxFps": 30,
+                    "maxStreams": 1,
+                    "maxLogLines": 500,
+                    "maxTokenTtlSec": 86400,
+                },
+                "captureActive": self.plugin_capture_active,
+                "captureIndicator": True,
+            }
+        if request == "openStream":
+            role = str(data.get("role", "program") or "program")
+            if role != "program" and not self.plugin_features.get("stream.role.preview"):
+                return {"ok": False, "error": "preview role is not supported"}
+            return {
+                "ok": True,
+                "running": True,
+                "reused": False,
+                "role": role,
+                "url": "http://127.0.0.1:1/stream.mjpg?token=fake",
+                "snapshotUrl": "http://127.0.0.1:1/snapshot.jpg?token=fake",
+                "token": "fake",
+                "expires": 0,
+                "expiresAtMs": 0,
+                "width": int(data.get("width", 320) or 320),
+                "height": int(data.get("height", 180) or 180),
+                "targetFps": int(data.get("fps", 5) or 5),
+                "quality": int(data.get("quality", 60) or 60),
+                "capture": {"active": True, "viewers": 1, "capturedFrames": 0, "encodedFrames": 0},
+                "http": {"totalRequests": 0, "streamRequests": 0, "activeConnections": 1},
+            }
+        if request == "closeStream":
+            return {"ok": True, "closed": True}
+        if request == "getStream":
+            return {"ok": True, "running": False, "role": "program"}
+        if request == "tbar":
+            # 契约：非演播室模式明确失败，不假装成功
+            if not st.studio_mode:
+                return {"ok": False, "error": "studio mode is not active"}
+            try:
+                pos = float(data.get("position", 0.0))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "position must be a number"}
+            release = bool(data.get("release", False))
+            if release:
+                # 松手＝收尾：插件的 end_session 会把会话关掉，位置回 0
+                st.plugin_tbar_session = False
+                st.tbar_position = 0.0
+            else:
+                st.tbar_position = max(0.0, min(1.0, pos))
+                # 推到非零位置＝会话开着（真实插件就是这么维持的）
+                st.plugin_tbar_session = st.tbar_position > 0.0
+            return {
+                "ok": True,
+                "applied": True,
+                "position": st.tbar_position,
+                "studioMode": True,
+                "transitioning": st.plugin_tbar_session,
+                "transition": st.current_transition,
+                "durationMs": st.transition_duration,
+                "frontendPosition": st.tbar_position,
+            }
+        if request == "getTbar":
+            return {
+                "ok": True,
+                "applied": True,
+                "position": st.tbar_position,
+                "studioMode": st.studio_mode,
+                "transitioning": st.plugin_tbar_session,
+                "transition": st.current_transition,
+                "durationMs": st.transition_duration,
+                "frontendPosition": st.tbar_position,
+            }
+        if request == "getMachineStats":
+            return {"ok": True, **self.plugin_machine}
+        if request == "getRecentLogs":
+            levels = {"error": 100, "warning": 200, "info": 300, "debug": 400}
+            threshold = levels.get(str(data.get("level", "info")), 300)
+            limit = max(1, min(int(data.get("limit", 100) or 100), 500))
+            since = int(data.get("since", 0) or 0)
+            lines = [
+                line
+                for line in self.plugin_logs
+                if int(line.get("level", 300)) <= threshold
+                and int(line.get("timestamp", 0)) >= since
+            ][-limit:]
+            return {
+                "ok": True,
+                "count": len(lines),
+                "level": str(data.get("level", "info")),
+                "streamEnabled": bool(self.plugin_stream_enabled),
+                "lines": lines,
+            }
+        if request == "setLogStream":
+            self.plugin_stream_enabled = bool(data.get("enabled", False))
+            return {
+                "ok": True,
+                "enabled": self.plugin_stream_enabled,
+                "level": str(data.get("level", "warning")),
+            }
+        if request == "getCaptureState":
+            return {
+                "ok": True,
+                "captureActive": self.plugin_capture_active,
+                "streamRunning": self.plugin_stream_active,
+                "viewers": self.plugin_capture_viewers,
+                "indicatorRunning": self.plugin_capture_active,
+                "indicatorVisible": self.plugin_capture_active,
+            }
+        return None
+
+    def emit_vendor_event(self, event_type: str, data: dict, vendor: str = "obsrs") -> None:
+        """从测试线程推一条 `VendorEvent`（真插件也是这么发的）。"""
+        self.broadcast_threadsafe(
+            "VendorEvent",
+            {"vendorName": vendor, "eventType": event_type, "eventData": dict(data)},
+        )
+
     async def _delay_response(self, req_type: str) -> None:
         """按 `slow_responses` 把这一次响应帧压后发。
 
@@ -549,6 +803,8 @@ class FakeObsServer:
 
     def _dispatch(self, req_type: str, payload: dict) -> tuple[dict | None, tuple[str, dict] | None]:
         st = self.state
+        if req_type == "CallVendorRequest":
+            return self._dispatch_vendor(payload)
         if req_type == "GetVersion":
             return {
                 "obsVersion": self.obs_version
@@ -1159,11 +1415,15 @@ class FakeObsServer:
         # 高频事件必须单独置位才推：真实 OBS 也是这样，
         # 只订阅了 Inputs 类别的连接收不到 InputVolumeMeters。
         needs_meter_bit = event_type == "InputVolumeMeters"
+        needs_vendor_bit = event_type == "VendorEvent"
         for ws in list(self._connections):
             subs = self._subs.get(ws, 0)
             if not subs:
                 continue
             if needs_meter_bit and not (subs & HIGH_VOLUME_METERS_BIT):
+                continue
+            if needs_vendor_bit and not (subs & VENDOR_EVENTS_BIT):
+                # 与真实 OBS 一致：没订阅 Vendors 就连 vendor 事件也收不到。
                 continue
             try:
                 await ws.send(message)

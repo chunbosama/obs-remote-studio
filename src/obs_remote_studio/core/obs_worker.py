@@ -28,6 +28,7 @@ from websocket import (
 
 from . import protocol as P
 from . import protocol_v4 as V4
+from . import plugin as PV
 from .client_v4 import V4EventClient, V4ReqClient, detect_protocol
 from .client_v5 import VerifiedReqClient
 
@@ -81,6 +82,11 @@ class ObsWorker(QObject):
     # kind: "request" / "response" / "event" / "error"；payload 是已经可读的 dict/str。
     # 与业务信号并行发送，诊断窗口关闭时没人接收，开销只是几次 emit。
     raw_trace = Signal(str, str, object)
+    # 插件（vendor）请求的结果与失败单独一条通道：请求名在界面上是 `getInfo`
+    # 这类短名，和 obs-websocket 的官方请求名不在一套命名空间里，
+    # 混进 result_ready 会让 `_handle_xxx` 的分派规则变味。
+    vendor_result = Signal(str, object)      # 插件请求名, 响应
+    vendor_failed = Signal(str, str, int)    # 插件请求名, 原因, error_code
 
     # ---- 主线程 -> 工作线程 ----
     request_connect = Signal(dict)
@@ -293,6 +299,19 @@ class ObsWorker(QObject):
     def _make_callback(self, event_type: str, callback_name: str):
         def handler(data, _type=event_type):
             # 该回调运行在 EventClient 自己的线程里，Qt 会自动排队到主线程
+            if _type == "VendorEvent":
+                # 插件事件：`eventData` 是任意 JSON，obsws-python 原样挂在属性上。
+                # 这里拍成普通 dict 再往上发 —— 上层只按
+                # vendorName / eventType / eventData 三个键分派，不依赖 dataclass 形状
+                # （嵌套对象在 as_dataclass 里也确实是普通 dict）。
+                payload = {
+                    "vendorName": getattr(data, "vendor_name", "") or "",
+                    "eventType": getattr(data, "event_type", "") or "",
+                    "eventData": getattr(data, "event_data", {}) or {},
+                }
+                self.raw_trace.emit("<-", "event", payload)
+                self.event_received.emit(_type, payload)
+                return
             self.raw_trace.emit("<-", "event", {"eventType": _type, "eventData": _to_plain(data)})
             self.event_received.emit(_type, data)
 
@@ -312,6 +331,20 @@ class ObsWorker(QObject):
             self.request_failed.emit(request_type, "未连接到 OBS", True, 0)
             return
 
+        # 插件请求（`@vendor:getInfo`）在这里换成真正的 `CallVendorRequest`。
+        # 走同一条通道是刻意的：会话号过滤、requestId 配对、迟到响应丢弃、
+        # 失败分类这些纪律已经在这条路上验过了，另起一条必然漏几样。
+        vendor = P.is_vendor_request(request_type)
+        vendor_name = P.vendor_name_of(request_type) if vendor else ""
+        wire_type = P.REQ_CALL_VENDOR if vendor else request_type
+        wire_data = request_data
+        if vendor:
+            wire_data = {
+                "vendorName": PV.VENDOR,
+                "requestType": vendor_name,
+                "requestData": request_data or {},
+            }
+
         # 记住本次用的是哪个 ReqClient 与哪个会话。换连接（重连/切 OBS）时会 `_safe_close()`
         # + 新建 client，此刻**旧 socket 上正在飞的请求**仍会返回失败 ——
         # 那条失败属于上一条连接，绝不能算到新连接头上（否则会误判掉线、触发多余重连，
@@ -322,35 +355,41 @@ class ObsWorker(QObject):
         # 直接用 send(requestType, requestData)：
         # obsws-python 生成的便捷方法参数名与协议字段并不总是一致
         # （例如 get_scene_item_list(name) 对应协议字段 sceneName），走 send 更稳。
-        self.raw_trace.emit("->", "request", {"requestType": request_type, "requestData": request_data})
+        self.raw_trace.emit("->", "request", {"requestType": wire_type, "requestData": wire_data})
         try:
-            response = client.send(request_type, request_data or None)
+            response = client.send(wire_type, wire_data or None)
         except (OBSSDKRequestError, OBSSDKTimeoutError,
                 WebSocketConnectionClosedException, WebSocketException, OSError,
                 json.JSONDecodeError) as exc:
             if client is not self._req or session != self._session:
                 # 连接已被替换/关闭：这条失败是上一轮的残响，直接丢弃
-                logger.debug("丢弃旧连接上的失败结果：%s（%s）", request_type, exc)
-                self._trace_dropped(request_type, "连接已更换，该失败属于上一条连接，已丢弃")
+                logger.debug("丢弃旧连接上的失败结果：%s（%s）", wire_type, exc)
+                self._trace_dropped(wire_type, "连接已更换，该失败属于上一条连接，已丢弃")
                 return
-            self._emit_request_failure(request_type, exc)
+            self._emit_request_failure(wire_type, exc, vendor_name=vendor_name)
             return
         except Exception as exc:  # noqa: BLE001
             if client is not self._req or session != self._session:
-                logger.debug("丢弃旧连接上的异常结果：%s（%s）", request_type, exc)
-                self._trace_dropped(request_type, "连接已更换，该异常属于上一条连接，已丢弃")
+                logger.debug("丢弃旧连接上的异常结果：%s（%s）", wire_type, exc)
+                self._trace_dropped(wire_type, "连接已更换，该异常属于上一条连接，已丢弃")
                 return
-            self.raw_trace.emit("<-", "error", {"requestType": request_type, "error": str(exc)})
-            self.request_failed.emit(request_type, str(exc), False, 0)
+            self.raw_trace.emit("<-", "error", {"requestType": wire_type, "error": str(exc)})
+            if vendor:
+                self.vendor_failed.emit(vendor_name, str(exc), 0)
+            else:
+                self.request_failed.emit(request_type, str(exc), False, 0)
             return
 
         if client is not self._req or session != self._session:
             # 响应迟到且连接已换人：结果同样不能用
-            logger.debug("丢弃旧连接上的迟到响应：%s", request_type)
-            self._trace_dropped(request_type, "连接已更换，迟到的响应已丢弃")
+            logger.debug("丢弃旧连接上的迟到响应：%s", wire_type)
+            self._trace_dropped(wire_type, "连接已更换，迟到的响应已丢弃")
             return
-        self.raw_trace.emit("<-", "response", {"requestType": request_type, "response": _to_plain(response)})
-        self.result_ready.emit(request_type, response)
+        self.raw_trace.emit("<-", "response", {"requestType": wire_type, "response": _to_plain(response)})
+        if vendor:
+            self.vendor_result.emit(vendor_name, response)
+        else:
+            self.result_ready.emit(request_type, response)
 
     def _on_stale_frame(self, data: dict) -> None:
         """有一条迟到的响应被丢弃（`VerifiedObsClient.on_stale` 回调）。
@@ -384,8 +423,25 @@ class ObsWorker(QObject):
             {"requestType": request_type, "dropped": True, "reason": reason},
         )
 
-    def _emit_request_failure(self, request_type: str, exc: BaseException) -> None:
-        """按异常类型归好类，再把失败抛给主线程。"""
+    def _emit_request_failure(
+        self, request_type: str, exc: BaseException, vendor_name: str = ""
+    ) -> None:
+        """按异常类型归好类，再把失败抛给主线程。
+
+        `vendor_name` 非空表示这是一条插件请求（线上是 `CallVendorRequest`）——
+        失败要回到 `vendor_failed`，否则 controller 那套 `_handle_get_info`
+        永远等不到"插件没装"这个结论。帧里额外带上 `vendorRequestType`，
+        排障时不用再去翻上一条请求帧才知道是哪条插件请求失败。
+        """
+
+        def note(extra: dict | None = None) -> dict:
+            frame = {"requestType": request_type}
+            if vendor_name:
+                frame["vendorRequestType"] = vendor_name
+            if extra:
+                frame.update(extra)
+            return frame
+
         if isinstance(exc, OBSSDKRequestError):
             # obs-websocket 的 requestStatus.code 在异常里是 .code；
             # comment 只是给人看的文案（"Replay buffer is not available"），
@@ -396,34 +452,39 @@ class ObsWorker(QObject):
             # 之前这里记的是自定义的 {requestType, code, comment}，而诊断窗口的用途
             # 正是"看线上到底回了什么"——用户按 requestStatus.code 去找根本找不到，
             # 反而会以为"OBS 压根没回响应"。服务端明明回了，是客户端把它转手改了样。
-            self.raw_trace.emit(
-                "<-",
-                "response",
-                {
-                    "requestType": request_type,
-                    "requestStatus": {
-                        "result": False,
-                        "code": code,
-                        "comment": comment,
-                    },
-                },
-            )
-            self.request_failed.emit(request_type, comment, False, code)
+            payload = note()
+            payload["requestStatus"] = {"result": False, "code": code, "comment": comment}
+            self.raw_trace.emit("<-", "response", payload)
+            if vendor_name:
+                self.vendor_failed.emit(vendor_name, comment, code)
+            else:
+                self.request_failed.emit(request_type, comment, False, code)
             return
         if isinstance(exc, OBSSDKTimeoutError):
-            self.raw_trace.emit("<-", "error", {"requestType": request_type, "error": str(exc)})
-            self.request_failed.emit(request_type, str(exc), True, 0)
+            self.raw_trace.emit("<-", "error", note({"error": str(exc)}))
+            if vendor_name:
+                self.vendor_failed.emit(vendor_name, str(exc), 0)
+            else:
+                self.request_failed.emit(request_type, str(exc), True, 0)
             return
         if isinstance(exc, json.JSONDecodeError):
             # 连接正在拆除时 recv() 会拿到空帧，obsws-python 的 json.loads 就抛这个。
             # 它是**连接级**问题，不是"这次操作失败"，按断线处理才不会弹框误导用户。
             self.raw_trace.emit(
-                "<-", "error", {"requestType": request_type, "error": f"响应不是合法 JSON：{exc}"}
+                "<-", "error", note({"error": f"响应不是合法 JSON：{exc}"})
             )
-            self.request_failed.emit(request_type, "响应不是合法 JSON（连接可能已中断）", True, 0)
+            if vendor_name:
+                self.vendor_failed.emit(vendor_name, "响应不是合法 JSON（连接可能已中断）", 0)
+            else:
+                self.request_failed.emit(
+                    request_type, "响应不是合法 JSON（连接可能已中断）", True, 0
+                )
             return
-        self.raw_trace.emit("<-", "error", {"requestType": request_type, "error": str(exc)})
-        self.request_failed.emit(request_type, str(exc) or "连接已中断", True, 0)
+        self.raw_trace.emit("<-", "error", note({"error": str(exc)}))
+        if vendor_name:
+            self.vendor_failed.emit(vendor_name, str(exc) or "连接已中断", 0)
+        else:
+            self.request_failed.emit(request_type, str(exc) or "连接已中断", True, 0)
 
     # ---------------------------------------------------------------- 内部
     def _drop_event_link(self) -> None:

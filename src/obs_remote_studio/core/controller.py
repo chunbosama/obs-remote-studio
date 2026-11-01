@@ -15,6 +15,7 @@ from dataclasses import replace
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
 from . import audio
+from . import plugin as PV
 from . import protocol as P
 from .models import (
     AppConfig,
@@ -48,6 +49,10 @@ logger = logging.getLogger(__name__)
 
 TRANSPORT_FAILURE_THRESHOLD = 2  # 连续几次“连接级”失败才判定掉线
 
+# 插件侧机器/采集状态的刷新间隔。5 秒够用：剩余空间与"有没有人在看"都不是秒级信息，
+# 而每 5 秒两条轻请求的代价远小于每秒问一次。
+PLUGIN_MACHINE_INTERVAL_S = 5.0
+
 # L：媒体状态是逐源查询、响应不带 inputName，只能按顺序关联。
 # 上一批没回来时不许重开一批（会错配），但也不能无限等 —— 超过这个秒数重开。
 MEDIA_PENDING_TIMEOUT_S = 3.0
@@ -67,6 +72,17 @@ EVENT_RETRY_MAX_ATTEMPTS = 4
 # G4：推杆"推到底松手"之后，等多久还没任何转场动静就判定 OBS 没理会这次推杆
 TBAR_NO_EFFECT_CHECK_MS = 3000
 
+# G4（进阶模式）：插件直驱的推杆会在 OBS 侧拉起一个**手动转场会话**，
+# 只有收到 `release` 才会收尾。会话挂着的时候，OBS 的转场就停在半途，
+# 而 `OBSBasic::TransitionToScene()` 里有一句：
+#     if (usingPreviewProgram && stillTransitioning) goto cleanup;   // 静默跳过
+# （obs-studio 31.1.2 `frontend/widgets/OBSBasic_Transitions.cpp`）
+# 于是**此后所有转场**（本客户端的转场按钮 / 快捷转场 / OBS 本机的转场按钮）
+# 全部静默失败 —— 现场表现就是「转场按钮点了没反应」，而且怎么点都没用，
+# 只有在 OBS 里用鼠标拖一下 T 型推杆才恢复。
+# 所以这里的规矩是：**任何转场动作下发之前，先把半途挂着的手动会话收掉**。
+TBAR_SESSION_UNWIND_REASON = "先把半途挂起的手动转场会话收掉"
+
 # F2：一条缩略图请求最多等多久。超过就认为这一拍彻底没了下文（连接卡住 /
 # 响应被丢掉），把整条缩略图流水线作废重来 —— 否则那一格会永久占着队列，
 # 对应那块画面再也不刷新（"预览窗一直不动"）。
@@ -76,6 +92,14 @@ FRAME_STALE_SECONDS = 3.0
 # 作废重来会再叠 2 条。真到超过这个数，说明结局根本不再回来了（连接半死），
 # 此时留住队列也救不回归属，只要求别把内存和日志拖爆。
 MAX_FRAME_QUEUE_LEN = 8
+
+# D17：剩余空间的缓存有效期。
+# `shutil.disk_usage` 是**同步**调用，而录制目录是 **OBS 那台机器**上的路径：
+# 局域网映射盘、已断开的 UNC 路径上它会阻塞到 SMB 超时（可达数秒）。而这个查询
+# 挂在每次轮询里（默认 1s 一次）—— 表现为界面每秒顿一下、拖推子掉帧，
+# 日志里什么都没有。录制的几十秒里剩余空间不会有肉眼可见的变化，30s 足够。
+# **失败结果也缓存**：否则"查不了"的路径每秒重试一次，等于每秒卡一次。
+DISK_USAGE_TTL_S = 30.0
 
 # E9：批量静音的收尾等待窗口。
 # 用"时间窗口"而不是"计数到零"来界定这一批：`request_failed` 只带
@@ -119,6 +143,15 @@ _AUDIO_GET_REQUESTS = frozenset(
         P.REQ_GET_INPUT_AUDIO_TRACKS,
     }
 )
+
+
+def _disk_free_gb(path: str) -> float:
+    """真的去查盘的剩余空间 —— **同步，可能阻塞**（UNC / 映射盘会等到 SMB 超时）。
+
+    单独抽出来只为一件事：把"要不要查"（`_free_space_gb` 的 TTL 缓存）和
+    "怎么查"分开，测试才能直接数它被调用了几次，而不用去改 `shutil`。
+    """
+    return shutil.disk_usage(path).free / (1024 ** 3)
 
 
 class Controller(QObject):
@@ -169,6 +202,9 @@ class Controller(QObject):
         self._transition_watchdog.timeout.connect(self._on_transition_watchdog)
         # T 型推杆是否正处于"一次拖拽"中（只影响日志详略）
         self._tbar_in_drag = False
+        # 进阶模式下插件是否还挂着一次"推了但没 release"的手动转场会话。
+        # 它决定下一个转场动作要不要先收尾 —— 理由见 TBAR_SESSION_UNWIND_REASON。
+        self._tbar_session_open = False
         # "本版本 OBS 用不了推杆"只提醒一次，别每次拖动都刷日志
         self._tbar_version_warned = False
 
@@ -225,8 +261,19 @@ class Controller(QObject):
         # D17：录制目录只拉一次，之后靠本地磁盘查剩余空间
         self._record_directory: str = ""
         self._record_directory_asked: bool = False
+        # 剩余空间的缓存：(取到它的时刻, 当时的目录, 剩余 GB 或 None)。
+        # 见 DISK_USAGE_TTL_S —— 这个查询会在 UI 线程上**阻塞**。
+        self._free_space_cache: tuple[float, str, float | None] | None = None
         # M：切换场景集合/配置文件后要整体作废本地状态
         self._collection_switching: bool = False
+
+        # 插件（vendor obsrs）：连上后**只探测一次**，失败就认定"没装"，不重试。
+        # 重试没有意义（插件不会在会话中途装好），却会让每次重连多一次往返，
+        # 而且失败回执会被当成"OBS 又不支持某请求"污染能力表。
+        self._plugin_probe_at: float = 0.0
+        self._plugin_machine_at: float = 0.0
+        # 采集指示只提示一次（同一会话内），别每次轮询都弹
+        self._capture_notified: bool = False
 
         # P3：转场覆盖。`_override_pending_scene` 记住"这次 Get 问的是哪个场景"，
         # 响应回来时如果用户已经切走了，就丢弃它 —— 否则会把旧场景的覆盖
@@ -349,9 +396,11 @@ class Controller(QObject):
         self.store.set_tbar_ignored(False)
         self._tbar_version_warned = False
         self._transition_fallback_used = False
-        # 新连接：录制目录要重新问（可能换了台机器），RTT 样本也从头算
+        # 新连接：录制目录要重新问（可能换了台机器），RTT 样本也从头算。
+        # 剩余空间的缓存一并作废：换了台机器，旧数字没有意义。
         self._record_directory = ""
         self._record_directory_asked = False
+        self._free_space_cache = None
         self._heartbeat_deadline = 0.0
         self.store.set_health(ConnectionHealth())
 
@@ -376,6 +425,21 @@ class Controller(QObject):
         # 状态栏自己会显示"已连接"，这里只给地址，免得读成"已连接 已连接 …"
         conn = self.config.connection
         self.store.set_connection_state(CONNECTED, conn.label())
+
+        # 插件探测：标题/状态栏的「进阶模式」就取决于这一次的结果。
+        # 三处刻意不探测：①v4 没有 vendor 通道；②用户在连接设置里没启用；
+        # ③已经有结果（重连时 _on_connected 会重建 store.server_info，所以照常探测）。
+        self._capture_notified = False
+        self._plugin_machine_at = 0.0
+        if protocol == P4.MODE_COMPAT:
+            # v4 的 vendor 是 v5 才有的扩展点，问也是白问（后台还会回 204）
+            self.store.set_plugin(None)
+        elif not getattr(self.config, "plugin_enabled", True):
+            self.store.set_plugin(None)
+            logger.info("连接设置里未启用插件，按标准模式运行")
+        else:
+            self.store.set_plugin_probing()
+            self._probe_plugin()
         # 已经连上了，任何挂起的重连都要撤掉。
         # 不加这一步会出问题：上一轮掉线排的退避计时器如果在本次连接**之后**才到点，
         # 会再发一次 connect，于是 _on_connected 跑两遍、refresh_all 也跑两遍
@@ -518,6 +582,9 @@ class Controller(QObject):
         self._event_retry_timer.stop()
         self._event_retry_attempt = 0
         self._tbar_effect_timer.stop()
+        # 连接没了，插件那边挂着的手动转场会话也就无从收尾了；
+        # 留着这个标记只会在下次连上时发一条莫名其妙的 release。
+        self._tbar_session_open = False
         self._frame_queue.clear()
         self._frame_pending.clear()
         self._frame_orphans = 0
@@ -547,6 +614,16 @@ class Controller(QObject):
             # L1：媒体播放状态同样跟低频 —— 播放中才会变，没必要每秒查
             if self.store.media:
                 self.refresh_media_status()
+        # 插件：机器/采集状态 5 秒一拍（第一次由 getInfo 回来的 refresh_plugin_data 触发）。
+        # 先记时刻再发：失败也按这个节奏退让，绝不退化成"每秒重试一次"。
+        if self.plugin_ready():
+            now = time.monotonic()
+            if now - self._plugin_machine_at >= PLUGIN_MACHINE_INTERVAL_S:
+                self._plugin_machine_at = now
+                if self.plugin_supports(PV.FEATURE_MACHINE):
+                    self.send(P.vendor_request(PV.REQ_MACHINE_STATS))
+                if self.plugin_supports(PV.FEATURE_CAPTURE):
+                    self.send(P.vendor_request(PV.REQ_CAPTURE_STATE))
 
     def refresh_all(self) -> None:
         if self.store.connection_state != CONNECTED:
@@ -672,6 +749,17 @@ class Controller(QObject):
                 )
         if warning.free_gb is None:
             warning.free_gb = free_gb
+        # 装了插件仍然读不到盘 → **把原因说出来**。
+        # 标准模式下列表里只有一个沉默的 None（旧行为），值班的人根本不知道
+        # 是"没查"还是"查不了"；插件能带回 53/64/67 这类错误码，那就必须显示。
+        if (
+            not warning.level
+            and free_gb is None
+            and self.plugin_supports(PV.FEATURE_MACHINE)
+        ):
+            problem = self.store.machine.disk_problem()
+            if problem:
+                warning = RecordWarning(level="warn", message=problem)
         self.store.set_record_warning(warning)
 
     @property
@@ -680,21 +768,232 @@ class Controller(QObject):
 
         给「设置 → 输出 → 录像路径」做只读对照用：D17 算剩余空间时本来就要问
         这个值，顺手暴露出来，省得设置窗口再发一次 GetRecordDirectory。
+        装了插件时优先用插件报的目录（它读的是当前 profile 的输出配置，
+        比 GetRecordDirectory 更贴近 OBS 界面上的显示）。
         """
+        if self.plugin_supports(PV.FEATURE_MACHINE):
+            stats = self.store.machine
+            if stats.record_dir_known and stats.record_dir:
+                return stats.record_dir
         return self._record_directory
 
     def _free_space_gb(self) -> float | None:
-        if not self._record_directory:
+        """录制目录所在盘的剩余空间（GB）；查不到回 None。
+
+        **优先问插件**：插件就装在 OBS 那台机器上，读到的是真实值，而且不用
+        在 UI 线程上碰 UNC。没有插件才退回本地 `shutil` + TTL 缓存那条老路。
+
+        ⚠️ 本地那条路**必须走缓存**：`_disk_free_gb` 是同步阻塞调用，而这条路在
+        UI 线程的轮询里（见 DISK_USAGE_TTL_S）。失败结果同样缓存 —— "查不了"的路径
+        如果每秒重试一次，等于每秒卡一次，比不显示更糟。
+        """
+        if self.plugin_supports(PV.FEATURE_MACHINE):
+            stats = self.store.machine
+            if stats.disk_known:
+                return stats.free_gb()
+        directory = self._record_directory
+        if not directory:
             return None
+        now = time.monotonic()
+        cached = self._free_space_cache
+        if (
+            cached is not None
+            and cached[1] == directory
+            and now - cached[0] < DISK_USAGE_TTL_S
+        ):
+            return cached[2]
         try:
-            return shutil.disk_usage(self._record_directory).free / (1024 ** 3)
+            free_gb: float | None = _disk_free_gb(directory)
         except OSError:
             # 路径不存在（OBS 在别的机器上 / 盘符未挂载）：宁可不显示，也不报假的
-            return None
+            free_gb = None
+        self._free_space_cache = (now, directory, free_gb)
+        return free_gb
 
     def _handle_get_record_directory(self, data) -> None:
         self._record_directory = str(getattr(data, "record_directory", "") or "")
         self._refresh_record_warning()
+
+    # ---------------------------------------------------------------- 插件（vendor obsrs）
+    def plugin_ready(self) -> bool:
+        """插件装上了吗。**只表示"有"，不表示"某项能力有"**（那要 plugin_supports）。"""
+        return self.store.plugin is not None
+
+    def plugin_supports(self, feature: str) -> bool:
+        """插件某项能力是否可用。界面上所有插件相关控件都只认这一个入口。"""
+        return self.store.supports_plugin(feature)
+
+    def _probe_plugin(self) -> None:
+        """连上后问一次 `getInfo`。
+
+        **失败即认定"没装插件"，不重试**（契约 §1）：插件不会在会话中途装好，
+        重试只会让每次重连多一次往返，而回执还会被当成"OBS 不支持某请求"
+        污染能力表 —— 本项目因为"凭空造能力/凭一次失败下结论"都吃过亏。
+        """
+        if self.store.connection_state != CONNECTED:
+            return
+        self._plugin_probe_at = time.monotonic()
+        logger.debug("探测 OBS 端插件：%s", PV.REQ_GET_INFO)
+        self.send(P.vendor_request(PV.REQ_GET_INFO))
+
+    def refresh_plugin_data(self) -> None:
+        """拉一轮插件侧状态（机器 / 采集 / 推杆）。都是增强信息，失败不打扰用户。"""
+        if not self.plugin_ready():
+            return
+        if self.plugin_supports(PV.FEATURE_MACHINE):
+            self.send(P.vendor_request(PV.REQ_MACHINE_STATS))
+        if self.plugin_supports(PV.FEATURE_CAPTURE):
+            self.send(P.vendor_request(PV.REQ_CAPTURE_STATE))
+        if self.plugin_supports(PV.FEATURE_TBAR) and self.store.studio_mode:
+            self.send(P.vendor_request(PV.REQ_GET_TBAR))
+
+    def fetch_logs(self, level: str = "warning", limit: int = 200) -> bool:
+        """拉一次 OBS 端最近日志（Q10）。返回 False = 当前没有这个能力。"""
+        if not self.plugin_supports(PV.FEATURE_LOGS):
+            return False
+        self.send(
+            P.vendor_request(PV.REQ_RECENT_LOGS),
+            {"level": str(level), "since": 0, "limit": max(1, min(int(limit), 500))},
+        )
+        return True
+
+    def set_log_stream(self, enabled: bool, level: str = "warning") -> bool:
+        """打开/关闭日志尾流（`logLine` 事件，服务端限速 20 条/秒）。"""
+        if not self.plugin_supports(PV.FEATURE_LOGS):
+            return False
+        self.send(
+            P.vendor_request(PV.REQ_SET_LOG_STREAM),
+            {"enabled": bool(enabled), "level": str(level)},
+        )
+        return True
+
+    @Slot(str, object)
+    def _on_vendor_result(self, name: str, response) -> None:
+        payload = _vendor_payload(response)
+        if name == PV.REQ_GET_INFO:
+            self._handle_plugin_info(payload)
+            return
+        # 探测没通过（或用户没启用）时，一切插件结果都不该被当真 ——
+        # 它们可能是"上一次连接"的残响，也可能来自一个已被判定不可用的插件。
+        if not self.plugin_ready():
+            logger.debug("忽略插件响应 %s：当前没有可用插件", name)
+            return
+        if name == PV.REQ_MACHINE_STATS:
+            stats = PV.parse_machine_stats(payload)
+            if stats is not None:
+                self._plugin_machine_at = time.monotonic()
+                self.store.set_machine(stats)
+                # 剩余空间换了来源（插件读到的是 OBS 那台机器的真实值），
+                # 预警要立刻按新数字重算一遍，否则要等下一次录制状态刷新。
+                self._refresh_record_warning()
+            return
+        if name == PV.REQ_CAPTURE_STATE:
+            state = PV.parse_capture(payload)
+            if state is not None:
+                self.store.set_capture(state)
+                if state.active and not self._capture_notified:
+                    self._capture_notified = True
+                    logger.info("插件正在向外发送画面：%d 人观看", state.viewers)
+            return
+        if name == PV.REQ_RECENT_LOGS:
+            lines = PV.parse_logs(payload)
+            self.store.set_plugin_logs(lines)
+            hint = PV.failure_hint(lines)
+            if hint:
+                logger.info("根据 OBS 日志判断的失败原因：%s", hint)
+            return
+        if name in (PV.REQ_TBAR, PV.REQ_GET_TBAR):
+            state = PV.parse_tbar(payload)
+            if state is not None:
+                self._apply_plugin_tbar_state(state)
+            return
+        logger.debug("未处理的插件响应：%s", name)
+
+    def _apply_plugin_tbar_state(self, state) -> None:
+        """采纳插件回报的推杆 / 手动会话状态。
+
+        插件是手动转场会话的**唯一权威**（会话在它那儿开、也在它那儿收）：
+        它说会话结束了，本地的「转场中」就得立刻收 —— 否则转场按钮会一直卡在
+        「转场中…」点不动，只能等 5 秒看门狗兜底（现场就是"按钮用不了"）。
+
+        **只往下收、不往上置**：开始转场由 OBS 自己的 `SceneTransitionStarted`
+        事件负责，插件这条上报只用来纠正"已经结束了"。
+        """
+        self._tbar_session_open = bool(state.transitioning)
+        self.store.set_tbar_position(state.position)
+        self.store.set_tbar_ignored(False)
+        if not state.transitioning:
+            self._transition_watchdog.stop()
+            self.store.set_transitioning(False)
+
+    def _handle_plugin_info(self, payload) -> None:
+        info = PV.parse_info(payload)
+        if info is None:
+            # 契约：ok=false 或结构不对都当"没装"。此刻模式回落成标准模式，
+            # 用户看到的就是「标准模式」而不是一个半残的"进阶"。
+            self.store.set_plugin(None)
+            logger.info("OBS 端未安装插件（getInfo 未返回能力表），按标准模式运行")
+            return
+        self.store.set_plugin(info)
+        logger.info(
+            "已连接 OBS 端插件 %s（api %d）：%s → %s",
+            info.plugin_version or "未知版本",
+            info.api_version,
+            PV.feature_summary(info),
+            "进阶模式",
+        )
+        # 能力到手就顺手拉一轮，界面不用等下一个 5 秒拍子
+        self.refresh_plugin_data()
+
+    @Slot(str, str, int)
+    def _on_vendor_failed(self, name: str, message: str, code: int) -> None:
+        """插件请求失败。**不弹框**：插件是增强项，缺了它功能仍在（走标准模式）。
+
+        但 `getInfo` 的失败必须落到状态里 —— 它决定了标题上写"进阶"还是"标准"。
+        """
+        if name == PV.REQ_GET_INFO:
+            self.store.set_plugin(None)
+            logger.info(
+                "插件探测失败（code=%s）：%s；按标准模式运行，不再重试", code, message
+            )
+            return
+        logger.debug("插件请求 %s 失败（code=%s）：%s", name, code, message)
+
+    @Slot(dict)
+    def _event_vendor_event(self, data) -> None:
+        """`VendorEvent` 分派。worker 已把它拍成 dict（vendorName/eventType/eventData）。"""
+        if not isinstance(data, dict):
+            return
+        vendor = str(data.get("vendorName", "") or "")
+        # 别名也要认：0.1.x 的插件可能用旧名发（契约 §0 说事件只从主名发一次，
+        # 但客户端这边多认一个名字没有成本，反而省掉一类"为什么不更新"的疑难）。
+        if vendor not in (PV.VENDOR, PV.VENDOR_ALIAS):
+            return
+        payload = data.get("eventData") or {}
+        etype = str(data.get("eventType", "") or "")
+        if etype == PV.EVENT_TBAR_CHANGED:
+            state = PV.parse_tbar(payload, strict=False)
+            if state is not None:
+                # 本机有人拖前端推杆时，插件会推它那边的权威位置 ——
+                # 直接采用，免得两侧长期各说各话。
+                # 会话是否还开着也一并采纳（插件自己超时会收尾，这时要跟着复位）。
+                self._apply_plugin_tbar_state(state)
+            return
+        if etype == PV.EVENT_LOG_LINE:
+            line = PV.parse_log_line(payload)
+            if line is None:
+                return
+            lines = list(self.store.plugin_logs)
+            lines.append(line)
+            # 与插件侧的环形缓冲同量级，界面常开也不会无限涨
+            self.store.set_plugin_logs(lines[-500:])
+            return
+        if etype == PV.EVENT_STREAM_STATS:
+            # 画面统计目前只用于诊断（实时画面本体走 HTTP 数据面），
+            # 不做成状态槽位：多一个"看起来像状态"的字段只会让人误以为它在驱动 UI。
+            logger.debug("插件画面统计：%s", payload)
+            return
+        logger.debug("未处理的插件事件：%s", etype)
 
     # ---------------------------------------------------------------- E9：一键全静音
     def set_all_muted(self, muted: bool) -> None:
@@ -1302,6 +1601,9 @@ class Controller(QObject):
     def set_transition(self, name: str) -> None:
         if not name or name == self.store.current_transition:
             return
+        # 换转场会 swap 掉输出上的转场对象，而半途的手动会话正挂在那上面：
+        # 不先收掉就会把一个"卡在半途"的转场对象换出去，之后照样没人收尾
+        self.unwind_tbar_session("切换转场方式")
         self.store.set_current_transition(name)
         self.send(P.REQ_SET_CURRENT_SCENE_TRANSITION, {"transitionName": name})
 
@@ -1411,11 +1713,22 @@ class Controller(QObject):
         self.send(P.REQ_SET_CURRENT_PREVIEW_SCENE, {"sceneName": name})
 
     def trigger_transition(self) -> None:
-        """用当前转场把预览切到节目。"""
+        """用当前转场把预览切到节目。
+
+        **进阶模式下必须先收掉半途的手动推杆会话**：手动会话挂着时 OBS 的转场
+        停在 0..1 之间，`TransitionToScene()` 会直接跳过，按钮点了毫无反应
+        （详见 TBAR_SESSION_UNWIND_REASON）。
+        """
+        self.unwind_tbar_session("执行转场")
         self.send(P.REQ_TRIGGER_STUDIO_MODE_TRANSITION)
 
     # ---- G4：T 型推杆 ----
     def tbar_supported(self) -> bool:
+        # 插件直驱优先：它绕开 obs-studio #11372（29.1+ 前端推杆设值不刷新），
+        # 所以装了插件的机器**不再受"29.0.2 及更早"那个版本闸门限制**。
+        # 这也是进阶模式与标准模式在推杆上唯一的区别 —— 界面上不用知道细节。
+        if self.plugin_supports(PV.FEATURE_TBAR):
+            return True
         return self.store.supports(P.REQ_SET_TBAR_POSITION)
 
     def set_tbar_position(self, position: float, release: bool = False) -> None:
@@ -1426,6 +1739,9 @@ class Controller(QObject):
         """
         if not self.store.studio_mode:
             logger.warning("T 型推杆未下发：本地认为不在工作室模式")
+            return
+        if self.plugin_supports(PV.FEATURE_TBAR):
+            self._set_tbar_via_plugin(position, release)
             return
         if not P.tbar_version_ok(self.store.server_info.obs_version):
             # 这个版本的 OBS 通过 API 根本做不了手动推杆（见 protocol.TBAR_LAST_WORKING_VERSION）。
@@ -1471,6 +1787,62 @@ class Controller(QObject):
         if self.store.transitioning:
             self._arm_transition_watchdog()
 
+    def _set_tbar_via_plugin(self, position: float, release: bool) -> None:
+        """走插件推杆（Q7）。
+
+        与标准模式那条路的差别：**不做版本闸门**（插件直接对转场对象设手动时间，
+        绕开了前端控件那个缺陷），也**不猜位置** —— 插件的 `tbarChanged` 会把它
+        维护的权威位置推回来，客户端照单接收即可。
+        """
+        if self.store.connection_state != CONNECTED:
+            return
+        pos = PV.clamp01(float(position))
+        self.send(
+            P.vendor_request(PV.REQ_TBAR),
+            {"position": pos, "release": bool(release)},
+        )
+        was_dragging = self._tbar_in_drag
+        self._tbar_in_drag = not release
+        # 会话在插件那边开着，只有 release 会把它收掉 —— 这里必须记住这件事，
+        # 否则一次"没松手"的推送会让 OBS 永久停在半途（见 TBAR_SESSION_UNWIND_REASON）
+        self._tbar_session_open = not release
+        if release or not was_dragging:
+            logger.info("T 型推杆下发（插件直驱）：position=%.3f release=%s", pos, release)
+        else:
+            logger.debug("T 型推杆下发（插件直驱）：position=%.3f", pos)
+        self.store.set_tbar_position(pos)
+        self.store.set_tbar_ignored(False)
+        if self.store.transitioning:
+            self._arm_transition_watchdog()
+
+    # ---- G4（进阶模式）：收掉半途的手动转场会话 ----
+    def tbar_session_open(self) -> bool:
+        """进阶模式下是否还有一次"推了但没 release"的手动转场会话。"""
+        return bool(self._tbar_session_open)
+
+    def unwind_tbar_session(self, reason: str) -> bool:
+        """把插件侧挂着的手动转场会话收尾（位置归 0 + release）。
+
+        **只对插件直驱有意义**：标准模式的 `SetTBarPosition` 走 OBS 自己的前端
+        逻辑，松手那条 release 一定会发出去；而插件这条路一次"没松手"的推送
+        （鼠标拖到一半丢了事件、拖到控件外面松开、界面被切走…）会让插件一直
+        维持手动会话，OBS 的转场就停在半途 —— 之后所有转场都被静默跳过。
+        所以任何转场动作之前都调一次；没有会话时什么都不做（不产生额外请求）。
+        """
+        if not self._tbar_session_open:
+            return False
+        # 会话只能由插件收：没连上 / 插件不支持推杆时，本地标记已是空头支票
+        if (
+            self.store.connection_state != CONNECTED
+            or not self.plugin_supports(PV.FEATURE_TBAR)
+        ):
+            self._tbar_session_open = False
+            return False
+        logger.info("收掉半途挂起的手动转场会话（%s）", reason)
+        self._set_tbar_via_plugin(0.0, True)
+        self.store.set_tbar_position(0.0)
+        return True
+
     # ---- G5：快捷转场槽位（客户端侧，不碰 profile）----
     def quick_transitions(self) -> list[dict]:
         return list(self.config.quick_transitions)
@@ -1496,6 +1868,9 @@ class Controller(QObject):
         if not name:
             return
         duration = int(slot.get("duration_ms", 0) or 0)
+        # 同 trigger_transition：半途的手动会话不先收掉，这条 Trigger 会被
+        # OBS 静默跳过（转场停在半途 → TransitionToScene 直接 goto cleanup）
+        self.unwind_tbar_session("执行快捷转场")
         # 顺序不能反：worker 按队列串行下发，OBS 会先改转场再执行
         self.store.set_current_transition(name, duration_ms=duration or None)
         self.send_if_supported(P.REQ_SET_CURRENT_SCENE_TRANSITION, {"transitionName": name})
@@ -2285,6 +2660,12 @@ class Controller(QObject):
         if not self.store.transitioning:
             return
         logger.warning("转场结束事件迟迟未到，自动复位「转场中」状态")
+        # 进阶模式下**不能只复位本地状态**：插件那边的手动会话还挂着，
+        # OBS 的转场就停在半途，之后所有转场都会被 OBS 静默跳过 ——
+        # 界面上按钮恢复了、点了却照样没反应，比一直灰着更误导人。
+        # 所以本地复位的同时把远端会话也收掉。
+        if self.unwind_tbar_session("转场结束事件丢失"):
+            logger.info("已一并收掉插件侧的手动转场会话")
         self.store.set_transitioning(False)
         self.store.set_tbar_position(0.0)
 
@@ -2665,8 +3046,28 @@ class Controller(QObject):
         w.event_received.connect(self._on_event)
         w.result_ready.connect(self._on_result)
         w.request_failed.connect(self._on_request_failed)
+        # 插件（vendor）单独一条通道：请求名与官方请求不在一个命名空间，
+        # 混进 result_ready 会让 `_handle_xxx` 的分派规则变味。
+        w.vendor_result.connect(self._on_vendor_result)
+        w.vendor_failed.connect(self._on_vendor_failed)
 
 # ---------------------------------------------------------------- 辅助
+def _vendor_payload(response) -> dict:
+    """从 `CallVendorRequest` 的响应里取出插件自己的 `responseData`。
+
+    obsws-python 会把它包成 dataclass（`vendor_name` / `request_type` /
+    `response_data`），而 `response_data` 是**普通 dict**（JSON 的本来形状）。
+    形状对不上时回空 dict —— 插件结果一律当"没有"，绝不让它把主链路带崩。
+    """
+    data = getattr(response, "response_data", None)
+    if isinstance(data, dict):
+        return data
+    if isinstance(response, dict):
+        inner = response.get("responseData")
+        return inner if isinstance(inner, dict) else response
+    return {}
+
+
 def _payload_to_tracks(payload) -> int:
     """GetInputAudioTracks 返回 {"1": true, "2": false, ...} -> 位掩码。"""
     if not isinstance(payload, dict):

@@ -90,6 +90,9 @@ class AppSettings:
         # 协议：auto / v5 / v4。坏值一律回落 auto（理由同其它配置项）
         protocol = str(self._get("connection/protocol", "auto") or "auto").lower()
         cfg.protocol = protocol if protocol in ("auto", "v5", "v4") else "auto"
+        # 插件（进阶模式）。默认开：装了插件就该自动用上，没装则一次 getInfo 后
+        # 回落标准模式，代价只有一条请求。
+        cfg.plugin_enabled = self._get("plugin/enabled", True, bool)
         return cfg
 
     def _load_hidden_inputs(self) -> list[str]:
@@ -182,6 +185,7 @@ class AppSettings:
         )
         self._qs.setValue("ui/compact_mode", cfg.compact_mode)
         self._qs.setValue("connection/protocol", getattr(cfg, "protocol", "auto"))
+        self._qs.setValue("plugin/enabled", getattr(cfg, "plugin_enabled", True))
         self._qs.sync()
 
     # ------------------------------------------------------------ 最近连接

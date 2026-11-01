@@ -116,6 +116,16 @@ class ConnectDialog(QDialog):
         form.addRow("", self.remember_check)
         form.addRow("协议", self.protocol_combo)
 
+        # 插件（进阶模式）：关掉它就完全不发 CallVendorRequest，走纯 ws。
+        # 默认开：装了插件就该自动用上；没装则一次 getInfo 后回落标准模式。
+        self.plugin_check = QCheckBox("启用 OBS 端插件（进阶模式）")
+        self.plugin_check.setChecked(bool(settings.load_config().plugin_enabled))
+        self.plugin_check.setToolTip(
+            "插件装在 OBS 那台机器上，提供实时画面、机器磁盘、OBS 日志、推杆直驱。\n"
+            "没装插件时这次探测会失败，界面自动回落为「标准模式」，功能不受影响。"
+        )
+        form.addRow("", self.plugin_check)
+
         self.recent_combo = QComboBox()
         self.recent_combo.setPlaceholderText("最近连接")
         self.recent = settings.recent_connections()
@@ -207,6 +217,10 @@ class ConnectDialog(QDialog):
     def protocol_choice(self) -> str:
         """用户选的协议：auto / v5 / v4。"""
         return str(self.protocol_combo.currentData() or "auto")
+
+    def plugin_choice(self) -> bool:
+        """连接时是否启用插件。关闭 = 连探测都不发，直接标准模式。"""
+        return self.plugin_check.isChecked()
 
     def accept(self) -> None:  # noqa: D102
         if not self.host_edit.text().strip():
